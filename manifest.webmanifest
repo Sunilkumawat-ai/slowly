@@ -1,0 +1,25 @@
+{
+  "name": "Slowly",
+  "short_name": "Slowly",
+  "description": "Chat summaries that stay on your phone.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#F5F2EA",
+  "theme_color": "#F5F2EA",
+  "icons": [
+    { "src": "icon.svg", "sizes": "192x192 512x512", "type": "image/svg+xml", "purpose": "any" }
+  ],
+  "share_target": {
+    "action": "./share-target",
+    "method": "POST",
+    "enctype": "multipart/form-data",
+    "params": {
+      "title": "title",
+      "text": "text",
+      "files": [
+        { "name": "file", "accept": ["text/plain", ".txt"] }
+      ]
+    }
+  }
+}
