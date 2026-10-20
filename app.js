@@ -260,7 +260,7 @@ function parse(t) {
   return { gist: (g ? g[1] : t).trim().replace(/\s+/g, " "), todo: bullets(td && td[1]), dates: bullets(dt && dt[1]) };
 }
 
-async function summarize(text, lang, hooks = {}) {
+async function summarizeOld(text, lang, hooks = {}) {
   const t0 = performance.now();
   let tokens = 0, source, multi = false;
   if (text.length <= 5000) {
@@ -507,3 +507,43 @@ async function takeShared() {
     showNotice("Couldn't load the model engine. Check your connection and reload the page.");
   }
 })();
+
+/* ---------- better summaries for small models: three short questions ---------- */
+async function summarize(text, lang, hooks = {}) {
+  if (text.length > 3500) return summarizeOld(text, lang, hooks);
+  const t0 = performance.now();
+  const say = lang === "Hinglish" ? "Write in simple Hinglish (Hindi in English letters)."
+    : lang === "Hindi" ? "Write in Hindi." : "Write in English.";
+  const sys = "You read short chats and answer very briefly. Use only facts written in the chat. Never repeat a line. Never copy the chat. " + say;
+  let tokens = 0;
+  const q = async (instruction, max) => {
+    if (S.stopped) throw new Error("stopped");
+    const r = await S.engine.chat.completions.create({
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: "Chat:\n" + text + "\n\n" + instruction }
+      ],
+      stream: false, temperature: 0.1, top_p: 0.9, max_tokens: max,
+      frequency_penalty: 0.6, presence_penalty: 0.3
+    });
+    tokens += r.usage?.completion_tokens || 0;
+    return r.choices?.[0]?.message?.content || "";
+  };
+  const lines = (s) => {
+    const seen = new Set();
+    return s.split("\n")
+      .map((l) => l.replace(/^\s*[-*•\d.)]+\s*/, "").trim())
+      .filter((l) => l.length > 3 && !/^\[?\d{1,2}:\d{2}/.test(l) && !/^none\.?$/i.test(l))
+      .filter((l) => { const k = l.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; })
+      .slice(0, 6);
+  };
+  hooks.onStatus?.("Finding the gist…");
+  const gistRaw = await q("In one short sentence, say what this chat is about. Reply with the sentence only.", 60);
+  hooks.onStatus?.("Finding the tasks…");
+  const todoRaw = await q("List the tasks people said they will do. One per line, written as Name: task. At most 6 lines. Reply with the list only.", 140);
+  hooks.onStatus?.("Finding the dates…");
+  const datesRaw = await q("List every day, deadline or time mentioned. One per line, written as Day or time: what happens. At most 6 lines. Reply with the list only.", 140);
+  const secs = (performance.now() - t0) / 1000;
+  const gist = lines(gistRaw).slice(0, 2).join(" ") || "The model could not write a clear summary. Try a shorter chat or a bigger model.";
+  return { p: { gist, todo: lines(todoRaw), dates: lines(datesRaw) }, tokens, secs, speed: tokens / secs };
+}
