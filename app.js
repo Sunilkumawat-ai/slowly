@@ -509,7 +509,7 @@ async function takeShared() {
 })();
 
 /* ---------- better summaries for small models: three short questions ---------- */
-async function summarize(text, lang, hooks = {}) {
+async function summarizeV2(text, lang, hooks = {}) {
   if (text.length > 3500) return summarizeOld(text, lang, hooks);
   const t0 = performance.now();
   const say = lang === "Hinglish" ? "Write in simple Hinglish (Hindi in English letters)."
@@ -546,4 +546,49 @@ async function summarize(text, lang, hooks = {}) {
   const secs = (performance.now() - t0) / 1000;
   const gist = lines(gistRaw).slice(0, 2).join(" ") || "The model could not write a clear summary. Try a shorter chat or a bigger model.";
   return { p: { gist, todo: lines(todoRaw), dates: lines(datesRaw) }, tokens, secs, speed: tokens / secs };
+}
+
+/* ---------- summarize v3: three short questions, cleaner filters ---------- */
+async function summarize(text, lang, hooks = {}) {
+  if (text.length > 3500) return summarizeOld(text, lang, hooks);
+  const t0 = performance.now();
+  const say = lang === "Hinglish" ? "Write in simple Hinglish (Hindi in English letters)."
+    : lang === "Hindi" ? "Write in Hindi." : "Write in English.";
+  const sys = "You read short chats and answer very briefly. Use only facts written in the chat. Never repeat a line. Never copy the chat. " + say;
+  let tokens = 0;
+  const q = async (instruction, max) => {
+    if (S.stopped) throw new Error("stopped");
+    const r = await S.engine.chat.completions.create({
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: "Chat:\n" + text + "\n\n" + instruction }
+      ],
+      stream: false, temperature: 0.1, top_p: 0.9, max_tokens: max,
+      frequency_penalty: 0.6, presence_penalty: 0.3
+    });
+    tokens += r.usage?.completion_tokens || 0;
+    return r.choices?.[0]?.message?.content || "";
+  };
+  const dayTime = /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun|today|tomorrow|tonight|morning|evening|afternoon|night|noon)\b|\b\d{1,2}(:\d{2})?\s?(am|pm)\b|\b\d{1,2}:\d{2}\b|\b\d{1,2}(st|nd|rd|th)\b/i;
+  const clean = (s, dateMode) => {
+    const seen = new Set();
+    return s.split("\n")
+      .map((l) => l.trim())
+      .filter((l) => !/^[\s\[\(]*\d{0,2}:\d{2}/.test(l))
+      .map((l) => l.replace(/^(?:[-*•]|\d+[.)])\s*/, "").replace(/^name\s*:\s*/i, "").trim())
+      .filter((l) => l.length > 3 && !/:\s*$/.test(l) && !/^none\b/i.test(l))
+      .filter((l) => !/^sam:\s*buy milk/i.test(l) && !/monday 9 am:\s*team meeting/i.test(l))
+      .filter((l) => !dateMode || lang !== "English" || dayTime.test(l))
+      .filter((l) => { const k = l.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; })
+      .slice(0, 6);
+  };
+  hooks.onStatus?.("Finding the gist…");
+  const gistRaw = await q("In one short sentence, say what this chat is about. Reply with the sentence only.", 60);
+  hooks.onStatus?.("Finding the tasks…");
+  const todoRaw = await q("List what each person said they will do. One line per task, written as Person: task, using the real name of the person who said I will. Example: Sam: buy milk. At most 6 lines. Reply with the list only.", 140);
+  hooks.onStatus?.("Finding the dates…");
+  const datesRaw = await q("List the days and times mentioned in the chat and what happens then. One line each. Example: Monday 9 am: team meeting. At most 6 lines. Reply with the list only.", 140);
+  const secs = (performance.now() - t0) / 1000;
+  const gist = clean(gistRaw, false).slice(0, 2).join(" ") || "The model could not write a clear summary. Try a shorter chat or a bigger model.";
+  return { p: { gist, todo: clean(todoRaw, false), dates: clean(datesRaw, true) }, tokens, secs, speed: tokens / secs };
 }
