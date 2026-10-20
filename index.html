@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#F5F2EA" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#121614" media="(prefers-color-scheme: dark)">
+<title>Slowly: chat summaries that stay on your phone</title>
+<meta name="description" content="Paste a long group chat and get the gist, the to-dos and the dates. An open-weight model runs inside your browser, so your messages never leave your device.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232F4B3C'/%3E%3Cpath d='M9 17c3 4 11 4 14 0' stroke='%23F5F2EA' stroke-width='2.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="top">
+  <div class="brand">
+    <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="var(--brand)"/><path d="M9 17c3 4 11 4 14 0" stroke="var(--brand-ink)" stroke-width="2.5" fill="none" stroke-linecap="round"/></svg>
+    Slowly
+  </div>
+  <div class="net" id="net"><span class="dot"></span><span id="netText">Online</span></div>
+</header>
+
+<main class="pager" id="pager">
+
+  <!-- READ -->
+  <section class="panel" id="p-read" aria-label="Read">
+    <div class="inner">
+      <div class="hero">
+        <h1>Catch up on the group chat without reading it.</h1>
+        <p class="lede">Paste a long conversation. A language model running inside this page gives you the gist, what you need to do, and the dates that matter. Your messages never leave your phone.</p>
+      </div>
+
+      <div class="card" style="margin-top:20px">
+        <div class="row" style="justify-content:space-between;align-items:center">
+          <div>
+            <div class="fl" style="margin:0">Model</div>
+            <strong id="modelState">Not loaded</strong>
+          </div>
+          <button class="btn quiet" id="setupBtn" type="button">Set up</button>
+        </div>
+      </div>
+
+      <div class="label"><span class="num">01</span><h2>Chat</h2></div>
+      <div class="card">
+        <label class="fl" for="chat">Paste a chat, or share a WhatsApp export</label>
+        <textarea id="chat" placeholder="[10:02] Aarav: Are we still on for Saturday?&#10;[10:04] Meera: Haan, but cabs book karne hain…"></textarea>
+        <div class="meta"><span id="count">0 characters</span><span>Stays on this device</span></div>
+        <div class="row" style="margin-top:12px">
+          <button class="btn quiet" id="paste" type="button">Paste</button>
+          <button class="btn quiet" id="sample" type="button">Try a sample</button>
+          <button class="btn quiet" id="clear" type="button">Clear</button>
+        </div>
+      </div>
+
+      <div class="label"><span class="num">02</span><h2>Summary language</h2></div>
+      <div class="seg" id="lang" role="group" aria-label="Summary language">
+        <button type="button" data-lang="English" aria-pressed="true">English</button>
+        <button type="button" data-lang="Hinglish" aria-pressed="false">Hinglish</button>
+        <button type="button" data-lang="Hindi" aria-pressed="false">Hindi</button>
+      </div>
+
+      <div class="row" style="margin-top:18px">
+        <button class="btn primary block" id="go" type="button" disabled>Summarize</button>
+        <button class="btn block hidden" id="stop" type="button">Stop</button>
+      </div>
+      <p class="hint" id="goHint">Load a model first. Tap Set up above.</p>
+
+      <div id="result" class="hidden" aria-live="polite">
+        <div class="label"><span class="num">03</span><h2>Summary</h2></div>
+        <div class="card">
+          <div id="skel" class="hidden">
+            <div class="skel" style="width:94%"></div>
+            <div class="skel" style="width:78%"></div>
+            <div class="skel" style="width:86%"></div>
+          </div>
+          <pre class="live hidden" id="live"></pre>
+          <div id="out" class="hidden">
+            <p class="gist" id="gist"></p>
+            <h3 class="block-t">To do</h3>
+            <ul class="list" id="todo"></ul>
+            <h3 class="block-t">Dates and plans</h3>
+            <ul class="list dates" id="dates"></ul>
+            <div class="row" style="margin-top:20px">
+              <button class="btn quiet" id="copy" type="button">Copy</button>
+              <button class="btn quiet hidden" id="share" type="button">Share</button>
+            </div>
+          </div>
+        </div>
+        <dl class="stats hidden" id="stats">
+          <div><dt>Model</dt><dd id="sModel">-</dd></div>
+          <div><dt>Speed</dt><dd id="sSpeed">-</dd></div>
+          <div><dt>Output</dt><dd id="sTokens">-</dd></div>
+          <div><dt>Total time</dt><dd id="sTime">-</dd></div>
+        </dl>
+      </div>
+
+      <div class="install hidden" id="install">
+        <span>Add Slowly to your home screen.</span>
+        <button class="btn quiet" id="installBtn" type="button">Install</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- SAVED -->
+  <section class="panel" id="p-saved" aria-label="Saved">
+    <div class="inner">
+      <div class="hero">
+        <h1>Saved</h1>
+        <p class="lede">Your summaries, kept on this phone only.</p>
+      </div>
+      <input class="search" id="q" type="search" placeholder="Search saved summaries" aria-label="Search saved summaries">
+      <div id="saved" class="list-gap"></div>
+      <div class="row">
+        <button class="btn quiet hidden" id="wipe" type="button">Delete all</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- LAB -->
+  <section class="panel" id="p-lab" aria-label="Lab">
+    <div class="inner">
+      <div class="hero">
+        <h1>Lab</h1>
+        <p class="lede">Choose an open-weight model, load it, and measure how it runs on this phone.</p>
+      </div>
+
+      <div class="label"><span class="num">01</span><h2>Model</h2></div>
+      <div class="card">
+        <label class="fl" for="model">Open-weight model that runs on your device</label>
+        <select id="model" disabled><option>Preparing model list…</option></select>
+        <p class="hint" id="modelHint"></p>
+        <div class="row" style="margin-top:14px">
+          <button class="btn primary block" id="load" type="button" disabled>Download and load model</button>
+        </div>
+        <div class="progress hidden" id="progWrap" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="prog"></i></div>
+        <p class="status" id="status" aria-live="polite"></p>
+        <div class="notice hidden" id="notice" role="alert"></div>
+      </div>
+
+      <div class="label"><span class="num">02</span><h2>Benchmark</h2></div>
+      <div class="card">
+        <p class="lede" style="font-size:15px">Runs a fixed Hinglish test chat on the loaded model and records load time and speed. Switch models and run it again to compare.</p>
+        <div class="row" style="margin-top:14px">
+          <button class="btn primary block" id="bench" type="button" disabled>Run benchmark</button>
+        </div>
+        <div class="tbl-wrap hidden" id="tblWrap">
+          <table class="tbl">
+            <thead><tr><th>Model</th><th>Load</th><th>Tok/s</th><th>Time</th></tr></thead>
+            <tbody id="rows"></tbody>
+          </table>
+        </div>
+        <div class="row" style="margin-top:14px">
+          <button class="btn quiet hidden" id="exportMd" type="button">Copy as Markdown</button>
+          <button class="btn quiet hidden" id="clearBench" type="button">Clear</button>
+        </div>
+      </div>
+
+      <div class="label"><span class="num">03</span><h2>About</h2></div>
+      <div class="card">
+        <h3 class="block-t" style="margin-top:0">How it works</h3>
+        <p class="hint" style="margin-top:0">Your browser downloads a compressed open-weight model once and stores it. After that, the model runs on your phone's GPU through WebGPU. Long chats are read in parts and combined.</p>
+        <h3 class="block-t">Why open weights</h3>
+        <p class="hint" style="margin-top:0">The weights are public, so the model runs here with no account, no API key and no per-use fee. Your chat is never sent to a server, and you can switch models.</p>
+        <h3 class="block-t">Limits</h3>
+        <p class="hint" style="margin-top:0">Small models can miss details or misread tone. Treat the summary as a quick catch-up and check the original chat before acting on anything important. Needs a recent Chrome on Android with WebGPU.</p>
+      </div>
+      <p class="hint" style="margin-top:20px">Built with open-weight models for the Hacktoberfest 2026 Open-Source AI Challenge.</p>
+    </div>
+  </section>
+
+</main>
+
+<nav class="tabs" id="tabs" role="tablist" aria-label="Sections">
+  <button class="tab" role="tab" data-tab="0" aria-selected="true" type="button">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v11H9l-5 4z"/></svg>Read
+  </button>
+  <button class="tab" role="tab" data-tab="1" aria-selected="false" type="button">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4h10v16l-5-4-5 4z"/></svg>Saved
+  </button>
+  <button class="tab" role="tab" data-tab="2" aria-selected="false" type="button">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4h6M10 4v6l-5 9a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1l-5-9V4"/></svg>Lab
+  </button>
+  <span class="ind"></span>
+</nav>
+
+<div class="toast" id="toast" role="status"></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
