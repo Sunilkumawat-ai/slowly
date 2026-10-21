@@ -209,3 +209,228 @@ $("#lang").addEventListener("click", (e) => {
   S.lang = b.dataset.lang; haptic(8);
   $$("#lang button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
 });
+
+/* ---------- inference ---------- */
+async function ask(prompt, { max = 320, onToken } = {}) {
+  const stream = await S.engine.chat.completions.create({
+    messages: [{ role: "user", content: prompt }],
+    stream: true, temperature: 0.2, top_p: 0.9, max_tokens: max,
+    stream_options: { include_usage: true }
+  });
+  let out = "", usage = null, n = 0;
+  for await (const ch of stream) {
+    const d = ch.choices?.[0]?.delta?.content;
+    if (d) { out += d; n++; onToken?.(out); }
+    if (ch.usage) usage = ch.usage;
+    if (S.stopped) { try { S.engine.interruptGenerate(); } catch {} }
+  }
+  return { text: out, usage, chunks: n };
+}
+
+function splitChat(text, size = 3200) {
+  const parts = []; let cur = "";
+  for (const l of text.split("\n")) {
+    if ((cur + "\n" + l).length > size && cur) { parts.push(cur); cur = l; }
+    else cur = cur ? cur + "\n" + l : l;
+  }
+  if (cur) parts.push(cur);
+  return parts;
+}
+
+function format(lang) {
+  const L = lang === "Hinglish" ? "Hinglish (Hindi written in the Roman alphabet, mixed with simple English)"
+    : lang === "Hindi" ? "Hindi (Devanagari script)" : "English";
+  return `Write the answer in ${L}. Reply in exactly this format and nothing else:
+GIST: Two short sentences. What the chat is about and where things stand.
+TO DO:
+- One action per line. Say who owns it if the chat makes that clear.
+DATES:
+- Each plan, deadline or time that was mentioned. Write "None" if there are none.
+Keep the labels GIST, TO DO and DATES exactly as written. Use only what is in the chat. Do not invent names, times or amounts.`;
+}
+
+function parse(t) {
+  t = t.replace(/\*\*/g, "").replace(/^#+\s*/gm, "");
+  const g = /GIST:\s*([\s\S]*?)(?=\n\s*TO ?DO:|$)/i.exec(t);
+  const td = /TO ?DO:\s*([\s\S]*?)(?=\n\s*DATES?\b|$)/i.exec(t);
+  const dt = /DATES?[^:\n]*:\s*([\s\S]*)$/i.exec(t);
+  const bullets = (s) => (s || "").split("\n")
+    .map((l) => l.replace(/^\s*[-*•\d.)]+\s*/, "").trim())
+    .filter((l) => l && !/^none\.?$/i.test(l));
+  return { gist: (g ? g[1] : t).trim().replace(/\s+/g, " "), todo: bullets(td && td[1]), dates: bullets(dt && dt[1]) };
+}
+
+async function summarizeLong(text, lang, hooks = {}) {
+  const t0 = performance.now();
+  let tokens = 0, source, multi = false;
+  if (text.length <= 5000) {
+    source = `Here is a group chat:\n\n${text}\n\n${format(lang)}`;
+  } else {
+    multi = true;
+    const parts = splitChat(text), notes = [];
+    for (let i = 0; i < parts.length; i++) {
+      if (S.stopped) throw new Error("stopped");
+      hooks.onStatus?.(`Reading part ${i + 1} of ${parts.length}…`);
+      const r = await ask(`Here is part ${i + 1} of ${parts.length} of a group chat:\n\n${parts[i]}\n\nWrite 3 to 6 short bullet notes: key points, decisions, tasks (with who owns them) and any dates or times. Use only what is written.`, { max: 220 });
+      notes.push(r.text.trim());
+      tokens += r.usage?.completion_tokens || r.chunks;
+    }
+    source = `Here are notes taken from a long group chat:\n\n${notes.join("\n\n")}\n\n${format(lang)}`;
+  }
+  const r = await ask(source, { max: 360, onToken: hooks.onToken });
+  tokens += r.usage?.completion_tokens || r.chunks;
+  const secs = (performance.now() - t0) / 1000;
+  const decode = r.usage?.extra?.decode_tokens_per_s;
+  return { p: parse(r.text), tokens, secs, speed: !multi && decode ? decode : tokens / secs };
+}
+
+/* ---------- summarize:  model writes the gist and tasks, rules pull the dates, all checked against the chat ---------- */
+async function summarize(text, lang, hooks = {}) {
+  if (text.length > 3500) return summarizeLong(text, lang, hooks);
+  const t0 = performance.now();
+  const say = lang === "Hinglish" ? "Write in simple Hinglish (Hindi in English letters)."
+    : lang === "Hindi" ? "Write in Hindi." : "Write in English.";
+  const sys = "You read short chats and answer very briefly. Use only facts written in the chat. Never invent names, days or times. Never copy the chat. " + say;
+  let tokens = 0;
+  const q = async (instruction, max) => {
+    if (S.stopped) throw new Error("stopped");
+    const r = await S.engine.chat.completions.create({
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: "Chat:\n" + text + "\n\n" + instruction }
+      ],
+      stream: false, temperature: 0.1, top_p: 0.9, max_tokens: max,
+      frequency_penalty: 0.6, presence_penalty: 0.3
+    });
+    tokens += r.usage?.completion_tokens || 0;
+    return r.choices?.[0]?.message?.content || "";
+  };
+  const lines = (s) => {
+    const seen = new Set();
+    return s.split("\n")
+      .map((l) => l.trim())
+      .filter((l) => !/^[\s\[\(]*\d{0,2}:\d{2}/.test(l))
+      .map((l) => l.replace(/^(?:[-*•]|\d+[.)])\s*/, "").trim())
+      .filter((l) => l.length > 3 && !/:\s*$/.test(l) && !/^none\b/i.test(l))
+      .filter((l) => { const k = l.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
+  };
+
+  /* 1) read the chat into who / message */
+  const stamp = /^\s*(?:\[[^\]]*\]|\(?\d{1,2}[\/.]\d{1,2}[\/.]\d{2,4},?\s*\d{1,2}:\d{2}(?:\s?[ap]m)?\)?\s*-)\s*/i;
+  const msgs = [];
+  for (const raw of text.split("\n")) {
+    const m = raw.replace(stamp, "").match(/^([^:\n]{1,30}):\s*(.+)$/);
+    if (m) msgs.push({ who: m[1].trim(), msg: m[2].trim() });
+  }
+  const speakers = new Set(msgs.map((m) => m.who.toLowerCase()));
+
+  /* 2) model: gist and tasks */
+  hooks.onStatus?.("Finding the gist…");
+  const gistRaw = await q("In one short sentence, say what this chat is about. Reply with the sentence only.", 60);
+  hooks.onStatus?.("Finding the tasks…");
+  const todoRaw = await q("List what each person said they will do. One line per task, written as Name: task. Use only names from the chat. At most 6 lines. Reply with the list only.", 140);
+  hooks.onStatus?.("Checking tasks and dates…");
+
+  /* 3) tasks: rule-based first (I will ...), then model tasks that name a real speaker and are not repeats */
+  const willRe = /\b(i will|i'll|i am going to|i'm going to)\b|\b\w+(unga|ungi)\b/i;
+  const stop = new Set(["the", "and", "for", "you", "with", "from", "that", "this", "will", "are", "was", "has", "have"]);
+  const words = (s) => new Set(s.toLowerCase().match(/[a-z]{3,}/g)?.filter((w) => !stop.has(w)) || []);
+  const similar = (a, b) => {
+    const A = words(a), B = words(b);
+    if (!A.size || !B.size) return false;
+    let n = 0; A.forEach((w) => { if (B.has(w)) n++; });
+    return n / Math.min(A.size, B.size) >= 0.5;
+  };
+  const todo = [];
+  for (const m of msgs) {
+    if (!willRe.test(m.msg)) continue;
+    let t = m.msg.replace(/^(ok(ay)?|sure|done|great|fine|haan|theek hai|pakka)[,.! ]+/i, "")
+      .replace(/\b(i will|i'll|i am going to|i'm going to)\s+/i, "");
+    todo.push(m.who + ": " + t);
+  }
+  for (const l of lines(todoRaw)) {
+    const i = l.indexOf(":");
+    if (i < 1) continue;
+    if (speakers.size && !speakers.has(l.slice(0, i).trim().toLowerCase())) continue;
+    if (todo.some((x) => similar(x.slice(x.indexOf(":") + 1), l.slice(i + 1)))) continue;
+    todo.push(l);
+  }
+
+  /* 4) dates: pull the chat lines that name a day or a time (nothing is invented) */
+  const dayRe = /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|tonight|morning|evening|afternoon|night|noon|kal|parso|aaj|subah|shaam|raat|dopahar|baje|somvar|mangalvar|budhvar|guruvar|shukravar|shanivar|ravivar)\b|\b\d{1,2}(:\d{2})?\s?(am|pm)\b|\b\d{1,2}(st|nd|rd|th)\b|कल|परसों|आज|सुबह|शाम|रात|बजे|सोमवार|मंगलवार|बुधवार|गुरुवार|शुक्रवार|शनिवार|रविवार/i;
+  const pool = msgs.length ? msgs.map((m) => m.who + ": " + m.msg) : text.split(/[\n.!?]+/).map((s) => s.trim());
+  const dates = [], seenD = new Set();
+  for (const l of pool) {
+    if (!dayRe.test(l)) continue;
+    const k = l.toLowerCase();
+    if (seenD.has(k)) continue;
+    seenD.add(k);
+    dates.push(l.length > 110 ? l.slice(0, 107) + "…" : l);
+  }
+
+  const secs = (performance.now() - t0) / 1000;
+  const gist = lines(gistRaw).slice(0, 2).join(" ") || "The model could not write a clear summary. Try a shorter chat or a bigger model.";
+  return { p: { gist, todo: todo.slice(0, 7), dates: dates.slice(0, 6) }, tokens, secs, speed: tokens / secs };
+}
+
+/* ---------- render result ---------- */
+function fill(ul, items, emptyText, checks) {
+  ul.textContent = "";
+  if (!items.length) {
+    const li = document.createElement("li"), p = document.createElement("p");
+    p.className = "empty"; p.textContent = emptyText; li.appendChild(p); ul.appendChild(li); return;
+  }
+  items.forEach((txt) => {
+    const li = document.createElement("li");
+    if (checks) {
+      const c = document.createElement("input");
+      c.type = "checkbox"; c.className = "check"; c.setAttribute("aria-label", "Mark done");
+      c.addEventListener("change", () => { li.classList.toggle("done", c.checked); haptic(8); });
+      li.appendChild(c);
+    }
+    const s = document.createElement("span"); s.textContent = txt; li.appendChild(s);
+    ul.appendChild(li);
+  });
+}
+function showResult(p, stats) {
+  $("#result").classList.remove("hidden");
+  $("#skel").classList.add("hidden"); $("#live").classList.add("hidden");
+  $("#gist").textContent = p.gist;
+  fill($("#todo"), p.todo, "Nothing you need to do.", true);
+  fill($("#dates"), p.dates, "No dates or plans mentioned.", false);
+  $("#out").classList.remove("hidden");
+  if (stats) {
+    $("#sModel").textContent = S.modelLabel;
+    $("#sSpeed").textContent = stats.speed.toFixed(1) + " tok/s";
+    $("#sTokens").textContent = stats.tokens + " tokens";
+    $("#sTime").textContent = stats.secs.toFixed(1) + " s";
+    $("#stats").classList.remove("hidden");
+  } else { $("#stats").classList.add("hidden"); }
+}
+
+$("#go").addEventListener("click", async () => {
+  const text = chat.value.trim();
+  if (!S.engine || S.busy || text.length < 20) return;
+  S.busy = true; S.stopped = false; hideNotice(); refresh(); haptic(12);
+  const live = $("#live"), skel = $("#skel");
+  $("#result").classList.remove("hidden");
+  $("#out").classList.add("hidden"); $("#stats").classList.add("hidden");
+  live.classList.add("hidden"); live.textContent = ""; skel.classList.remove("hidden");
+  $("#go").classList.add("hidden"); $("#stop").classList.remove("hidden");
+  $("#result").scrollIntoView({ behavior: "smooth", block: "start" });
+  const show = (m) => { skel.classList.add("hidden"); live.classList.remove("hidden"); live.textContent = m; };
+  try {
+    const r = await summarize(text, S.lang, { onStatus: show, onToken: show });
+    if (S.stopped) { $("#result").classList.add("hidden"); }
+    else { showResult(r.p, r); addSaved(r.p); haptic([10, 40, 10]); }
+  } catch (e) {
+    console.error(e);
+    $("#result").classList.add("hidden");
+    if (!S.stopped) showNotice("Something went wrong while reading the chat. Try a shorter chat, or reload the model in the Lab tab.");
+  } finally {
+    S.busy = false;
+    $("#stop").classList.add("hidden"); $("#go").classList.remove("hidden");
+    refresh();
+  }
+});
+$("#stop").addEventListener("click", () => { S.stopped = true; try { S.engine.interruptGenerate(); } catch {} });
