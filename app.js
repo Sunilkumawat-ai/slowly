@@ -241,9 +241,14 @@ async function ask(prompt, { max = 320, onToken } = {}) {
   return { text: out, usage, chunks: n };
 }
 
-function splitChat(text, size = 3200) {
+function splitChat(text, size = 2800) {
   const parts = []; let cur = "";
+  const lines = [];
   for (const l of text.split("\n")) {
+    if (l.length <= size) lines.push(l);
+    else for (let i = 0; i < l.length; i += size) lines.push(l.slice(i, i + size));
+  }
+  for (const l of lines) {
     if ((cur + "\n" + l).length > size && cur) { parts.push(cur); cur = l; }
     else cur = cur ? cur + "\n" + l : l;
   }
@@ -268,7 +273,7 @@ function parse(t) {
   const td = /TO ?DO:\s*([\s\S]*?)(?=\n\s*DATES?\b|$)/i.exec(t);
   const dt = /DATES?[^:\n]*:\s*([\s\S]*)$/i.exec(t);
   const bullets = (s) => (s || "").split("\n")
-    .map((l) => l.replace(/^\s*[-*•\d.)]+\s*/, "").trim())
+    .map((l) => l.replace(/^\s*(?:[-*•]+|\d+[.)])\s*/, "").trim())
     .filter((l) => l && !/^none\.?$/i.test(l));
   return { gist: (g ? g[1] : t).trim().replace(/\s+/g, " "), todo: bullets(td && td[1]), dates: bullets(dt && dt[1]) };
 }
@@ -278,7 +283,14 @@ function parse(t) {
 const STAMP = /^\s*(?:\[[^\]]*\]|\(?\d{1,2}[\/.]\d{1,2}[\/.]\d{2,4},?\s*\d{1,2}:\d{2}(?:\s?[ap]m)?\)?\s*-)\s*/i;
 function readMsgs(text) {
   const msgs = [];
-  for (const raw of text.split("\n")) {
+  const lines = text.split("\n").map((l) => l.replace(/[\u200e\u200f\u202a-\u202e]/g, ""));
+  const stamped = lines.some((l) => STAMP.test(l));
+  for (const raw of lines) {
+    /* in an exported chat, a line with no time stamp continues the message before it */
+    if (stamped && !STAMP.test(raw)) {
+      if (msgs.length && raw.trim()) msgs[msgs.length - 1].msg += " " + raw.trim();
+      continue;
+    }
     const m = raw.replace(STAMP, "").match(/^([^:\n]{1,30}):\s*(.+)$/);
     if (m) msgs.push({ who: m[1].trim(), msg: m[2].trim() });
   }
@@ -321,9 +333,9 @@ const MISS_MSG = (n) => `${n} line${n > 1 ? "s" : ""} stayed in English. Try Lla
 
 /* ---------- labels in each language ---------- */
 const LBL = {
-  English: { todo: "To do", dates: "Dates and plans", noTodo: "Nothing you need to do.", noDates: "No dates or plans mentioned.", copy: "Copy", share: "Share", none: "None", asks: "asks" },
-  Hindi: { todo: "करने के काम", dates: "तारीख़ें और योजनाएँ", noTodo: "कोई काम नहीं।", noDates: "कोई तारीख़ या योजना नहीं।", copy: "कॉपी", share: "शेयर", none: "कोई नहीं", asks: "का अनुरोध" },
-  Hinglish: { todo: "Karne wale kaam", dates: "Dates aur plans", noTodo: "Koi kaam nahi.", noDates: "Koi date ya plan nahi.", copy: "Copy", share: "Share", none: "Koi nahi", asks: "ka request" }
+  English: { todo: "To do", dates: "Dates and plans", noTodo: "Nothing you need to do.", noDates: "No other dates or plans.", copy: "Copy", share: "Share", none: "None", asks: "asks" },
+  Hindi: { todo: "करने के काम", dates: "तारीख़ें और योजनाएँ", noTodo: "कोई काम नहीं।", noDates: "कोई अन्य तारीख़ या योजना नहीं।", copy: "कॉपी", share: "शेयर", none: "कोई नहीं", asks: "का अनुरोध" },
+  Hinglish: { todo: "Karne wale kaam", dates: "Dates aur plans", noTodo: "Koi kaam nahi.", noDates: "Koi aur date ya plan nahi.", copy: "Copy", share: "Share", none: "Koi nahi", asks: "ka request" }
 };
 
 /* ---------- days and times: a word list, so they are always correct ---------- */
@@ -365,7 +377,11 @@ function whenLocal(piece, lang) {
 /* ---------- translation: the model translates short lines, every line is checked ---------- */
 /* returns the clean line, or null if the line looks wrong (then the English line is kept) */
 function trFix(src, out, lang) {
-  out = (out || "").trim().replace(/[०-९]/g, (d) => "०१२३४५६७८९".indexOf(d));
+  out = (out || "").trim().replace(/^["'`]+|["'`]+$/g, "").replace(/^(?:output|translation|hindi|hinglish)\s*:\s*/i, "")
+    .replace(/[०-९]/g, (d) => "०१२३४५६७८९".indexOf(d));
+  /* the small model sometimes repeats the worked examples instead of translating */
+  const lo = src.toLowerCase();
+  if (TR[lang].ex.some((e) => !lo.includes(e[0]) && out.toLowerCase().includes(e[1].toLowerCase()))) return null;
   if (!out || out.length > src.length * 4 + 30 || gibberish(out)) return null;
   const nums = (s) => [...new Set(s.match(/\d+/g) || [])].sort().join(",");
   if (nums(src) !== nums(out)) return null;
@@ -377,7 +393,7 @@ function trFix(src, out, lang) {
 }
 const TR = {
   Hindi: {
-    intro: "Translate each numbered line from English to Hindi, written in Devanagari script.",
+    sys: "Translate the message from English to Hindi, written in Devanagari script. Keep names, numbers and times exactly as written. Reply with the translation only.",
     ex: [
       ["pay the rent", "किराया देना"],
       ["call the doctor", "डॉक्टर को फ़ोन करना"],
@@ -385,7 +401,7 @@ const TR = {
     ]
   },
   Hinglish: {
-    intro: "Translate each numbered line from English to Hinglish: Hindi written in the Roman alphabet, the way people type on WhatsApp.",
+    sys: "Translate the message from English to Hinglish: Hindi written in the Roman alphabet, the way people type on WhatsApp. Keep names, numbers and times exactly as written. Reply with the translation only.",
     ex: [
       ["pay the rent", "Rent dena"],
       ["call the doctor", "Doctor ko call karna"],
@@ -395,28 +411,24 @@ const TR = {
 };
 async function translateAll(srcs, lang, hooks, acc) {
   const cfg = TR[lang], res = [];
-  for (let i = 0; i < srcs.length; i += 6) {
+  /* one line per call, examples as earlier chat turns: a 1B model copies numbered examples when lines are batched */
+  for (let i = 0; i < srcs.length; i++) {
     if (S.stopped) throw new Error("stopped");
-    const part = srcs.slice(i, i + 6);
-    hooks.onStatus?.(`Translating to ${lang}… ${Math.min(i + 6, srcs.length)} of ${srcs.length}`);
-    const exIn = cfg.ex.map((e, k) => `${k + 1}. ${e[0]}`).join("\n");
-    const exOut = cfg.ex.map((e, k) => `${k + 1}. ${e[1]}`).join("\n");
-    const inp = part.map((s, k) => `${k + 1}. ${s}`).join("\n");
+    const s = srcs[i];
+    hooks.onStatus?.(`Translating to ${lang}… ${i + 1} of ${srcs.length}`);
+    const messages = [];
+    cfg.ex.forEach((e, k) => {
+      messages.push({ role: "user", content: (k === 0 ? cfg.sys + "\n\n" : "") + e[0] });
+      messages.push({ role: "assistant", content: e[1] });
+    });
+    messages.push({ role: "user", content: s });
     const r = await S.engine.chat.completions.create({
-      messages: [
-        { role: "system", content: "You are a careful translator. You translate short chat lines and never add or remove facts." },
-        { role: "user", content: `${cfg.intro} Keep names, numbers and times exactly as written. Do not explain. Reply with the numbered lines only.\n\nExample input:\n${exIn}\nExample output:\n${exOut}\n\nInput:\n${inp}\nOutput:` }
-      ],
-      stream: false, temperature: 0, top_p: 0.9, max_tokens: Math.min(420, 45 * part.length + 40)
+      messages, stream: false, temperature: 0, top_p: 0.9,
+      max_tokens: Math.min(220, (lang === "Hindi" ? 4 : 2) * s.length + 30)
     });
     acc.tokens += r.usage?.completion_tokens || 0;
     const d = r.usage?.extra?.decode_tokens_per_s; if (d) acc.speeds.push(d);
-    const map = {};
-    for (const l of (r.choices?.[0]?.message?.content || "").split("\n")) {
-      const m = /^\s*(\d+)[.)]\s*(.+)$/.exec(l);
-      if (m) map[+m[1]] = m[2].trim();
-    }
-    part.forEach((s, k) => res.push(trFix(s, map[k + 1], lang)));
+    res.push(trFix(s, (r.choices?.[0]?.message?.content || "").split("\n")[0], lang));
   }
   return res;
 }
@@ -439,10 +451,11 @@ async function summarizeLong(text, lang, hooks = {}) {
     const d = r.usage?.extra?.decode_tokens_per_s; if (d) acc.speeds.push(d);
   };
   let source;
-  if (text.length <= 5000) {
+  if (text.length <= 4000) {
     source = `Here is a group chat:\n\n${text}\n\n${format()}`;
   } else {
-    const parts = splitChat(text), notes = [];
+    let parts = splitChat(text); const notes = [];
+    if (parts.length > 12) { parts = parts.slice(-12); hooks.onWarn?.("Very long chat. Only the latest part was read."); }
     for (let i = 0; i < parts.length; i++) {
       if (S.stopped) throw new Error("stopped");
       hooks.onStatus?.(`Reading part ${i + 1} of ${parts.length}…`);
@@ -477,6 +490,8 @@ async function summarizeLong(text, lang, hooks = {}) {
 
 /* ---------- summarize: the model finds the gist and tasks in English, rules find the dates, then everything is put into the chosen language ---------- */
 async function summarize(text, lang, hooks = {}) {
+  /* curly quotes (iPhone keyboards) and invisible direction marks (iOS exports) break the word rules */
+  text = text.replace(/[\u2018\u2019\u02bc]/g, "'").replace(/[\u201c\u201d]/g, '"').replace(/[\u200e\u200f\u202a-\u202e]/g, "");
   if (text.length > 3500) return summarizeLong(text, lang, hooks);
   const t0 = performance.now();
   const sys = "You read short chats and answer very briefly. Use only facts written in the chat. Never invent names, days or times. Never copy the chat. Write in English.";
@@ -524,8 +539,11 @@ async function summarize(text, lang, hooks = {}) {
   const core = (msg) => clean(msg.replace(whenRe, ""))
     .replace(/\s+/g, " ").replace(/\s+([.,!?])/g, "$1")
     .replace(/^(i will|i'll|i am going to|i'm going to)\s+/i, "")
-    .replace(/[,.! ]+$/, "").trim();
-  const whenOf = (msg) => { const f = msg.match(whenRe); return f ? f.map((x) => x.trim()) : []; };
+    .replace(/[,.!? ]+$/, "").trim();
+  const whenOf = (msg) => (msg.match(whenRe) || []).map((x) => x.trim().replace(/^(?:on|at)\s+/i, ""));
+  /* one entry per sentence, so "I can come, but I will be late. Will reach by 8:30." is read as two things */
+  const items = [];
+  for (const m of msgs) for (const t of m.msg.split(/(?<=[.!?])\s+/)) if (t.trim()) items.push({ who: m.who, msg: t.trim() });
 
   /* 4) tasks: "I will ...", then requests ("please ..."), then model tasks that name a real speaker and are not repeats */
   const willRe = /\b(i will|i'll|i am going to|i'm going to)\b|\b\w+(unga|ungi)\b/i;
@@ -539,15 +557,17 @@ async function summarize(text, lang, hooks = {}) {
   };
   const todo = []; /* { who, what, when[], ask } */
   const taken = (what) => todo.some((x) => similar(x.what, what));
-  for (const m of msgs) {
+  const WILL = /\b(?:i will|i'll|i am going to|i'm going to)\s+/i;
+  for (const m of items) {
     const c = clean(m.msg);
     if (!willRe.test(c)) continue;
     if (/\b(i will|i'll)\s+be\b/i.test(c)) continue; /* "I will be late" is not a task */
-    const what = core(m.msg);
+    const wm = WILL.exec(m.msg);
+    const what = core(wm ? m.msg.slice(wm.index + wm[0].length) : m.msg);
     if (what) todo.push({ who: m.who, what, when: whenOf(m.msg), ask: false });
   }
-  for (const m of msgs) {
-    const r = /^(?:([A-Za-z]+),\s*)?please\s+(.+)$/i.exec(core(m.msg));
+  for (const m of items) {
+    const r = /^(?:([A-Za-z]+),?\s+)?please\s+(.+)$/i.exec(core(m.msg));
     if (!r) continue;
     const what = r[2].split(/[.!?]/)[0].trim();
     if (!what || taken(what)) continue;
@@ -564,12 +584,13 @@ async function summarize(text, lang, hooks = {}) {
   }
 
   /* 5) dates: pull the chat lines that name a day or a time (nothing is invented) */
-  const pool = msgs.length ? msgs : text.split(/[\n.!?]+/).map((s) => ({ who: "", msg: s.replace(STAMP, "").trim() })).filter((m) => m.msg);
+  const pool = msgs.length ? items : text.split(/[\n.!?]+/).map((s) => ({ who: "", msg: s.replace(STAMP, "").trim() })).filter((m) => m.msg);
   const dates = [], seenD = new Set(); /* { who, what, when[] } */
   for (const m of pool) {
     if (!dayRe.test(m.msg)) continue;
     const when = whenOf(m.msg);
-    let what = (when.length ? core(m.msg) : "") || clean(m.msg).replace(/[,.! ]+$/, "");
+    let what = (when.length ? core(m.msg) : "") || clean(m.msg).replace(/[,.!? ]+$/, "");
+    if (taken(what)) continue; /* already shown under To do */
     if (what.length > 90) what = what.slice(0, 87) + "…";
     const key = (when.join() + what).toLowerCase();
     if (seenD.has(key)) continue;
