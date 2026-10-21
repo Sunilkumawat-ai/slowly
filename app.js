@@ -1,18 +1,38 @@
-/* Slowly - app.js
-   On-device chat summaries with an open-weight model (WebLLM + WebGPU). */
+/* Slowly - app.js (v2)
+   On-device chat summaries with an open-weight model (WebLLM + WebGPU).
+   Rules find the facts, the model writes the gist and translates short lines,
+   and every model line is checked before it is shown. */
 
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
-/* pinned version: an update from the CDN can no longer break the app or change the code that reads your chat */
-const ENGINE_URL = "https://esm.run/@mlc-ai/web-llm@0.2.79";
+
+const ENGINE_URLS = [
+  "https://esm.run/@mlc-ai/web-llm@0.2.79",
+  "https://cdn.jsdelivr.net/npm/@mlc-ai/web-llm@0.2.79/+esm"
+];
 const KEY_SAVED = "slowly.saved";
 const KEY_BENCH = "slowly.bench";
 const KEY_MODEL = "slowly.model";
+const MAX_VRAM = 3800;
 
 const S = {
   webllm: null, engine: null, modelId: null, modelLabel: "", loadSecs: null,
-  busy: false, hasF16: false, stopped: false, lang: "English", shownLang: "English"
+  busy: false, loading: false, unsupported: false, hasF16: false,
+  stopped: false, lang: "English", shownLang: "English"
 };
+
+const TIERS = [
+  { re: /llama-3\.2-1b/i, tag: "Fast", rank: 0 },
+  { re: /qwen3-1\.7b/i, tag: "Balanced", rank: 1 },
+  { re: /llama-3\.2-3b/i, tag: "Better Hindi", rank: 2 },
+  { re: /qwen3-4b/i, tag: "Best quality, slow", rank: 3 },
+  { re: /qwen2\.5-1\.5b/i, tag: "Good English", rank: 4 },
+  { re: /qwen2\.5-3b/i, tag: "Accurate English", rank: 5 },
+  { re: /phi-3\.5-mini/i, tag: "Strong English, heavy", rank: 6 },
+  { re: /gemma-2-2b/i, tag: "Alternative", rank: 7 },
+  { re: /smollm2-1\.7b/i, tag: "Light", rank: 8 }
+];
+const tierOf = (id) => TIERS.find((t) => t.re.test(id || ""));
 
 const SAMPLE = `[09:12] Aarav: Guys, are we still doing the Lonavala trip this Saturday?
 [09:14] Meera: Yes! But we need to decide cars. I can drive mine, fits 4.
@@ -29,7 +49,6 @@ const SAMPLE = `[09:12] Aarav: Guys, are we still doing the Lonavala trip this S
 [09:44] Aarav: I'll forward the confirmation once it's done. Kabir, can you handle the printout?
 [09:45] Kabir: Sure, will do.`;
 
-/* Fixed Hinglish chat used by the benchmark, so every model gets the same input. */
 const BENCH_CHAT = `[09:12] Aarav: Bhai Saturday ko Lonavala ka plan pakka hai na?
 [09:14] Meera: Haan, meri car me 4 log aa sakte hain. Cars ka kaun dekhega?
 [09:15] Kabir: Main aa raha hu. Villa koi book kar do, lake ke paas wala 9000 per night hai.
@@ -58,7 +77,6 @@ function toast(msg, ms = 1800) {
 function haptic(p = 10) { try { navigator.vibrate && navigator.vibrate(p); } catch {} }
 function showNotice(msg) { const n = $("#notice"); n.textContent = msg; n.classList.remove("hidden"); }
 function hideNotice() { $("#notice").classList.add("hidden"); }
-/* the red box #notice lives in the Lab tab, so Read-tab errors need their own box on the Read tab */
 function readNotice(msg) {
   let n = $("#readNotice");
   if (!n) {
@@ -87,6 +105,7 @@ function prettyName(id) {
 function fmtDate(ts) {
   return new Date(ts).toLocaleString([], { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
 }
+function sizeB(id) { const m = /(\d+(?:\.\d+)?)b\b/i.exec(id || ""); return m ? parseFloat(m[1]) : 4; }
 
 /* ---------- connectivity ---------- */
 function paintNet() {
@@ -98,29 +117,48 @@ addEventListener("online", paintNet); addEventListener("offline", paintNet); pai
 
 /* ---------- swipe pager + tabs ---------- */
 const pager = $("#pager"), tabsEl = $("#tabs"), tabBtns = $$(".tab");
-function goTab(i) { pager.scrollTo({ left: i * pager.clientWidth, behavior: "smooth" }); }
+let curTab = 0;
+function goTab(i) { curTab = i; pager.scrollTo({ left: i * pager.clientWidth, behavior: "smooth" }); }
 tabBtns.forEach((b) => b.addEventListener("click", () => { haptic(8); goTab(+b.dataset.tab); }));
 let raf = 0;
 pager.addEventListener("scroll", () => {
   cancelAnimationFrame(raf);
   raf = requestAnimationFrame(() => {
-    const p = pager.scrollLeft / pager.clientWidth;
+    const p = pager.scrollLeft / (pager.clientWidth || 1);
     tabsEl.style.setProperty("--p", p.toFixed(3));
     const i = Math.round(p);
+    curTab = i;
     tabBtns.forEach((b, k) => b.setAttribute("aria-selected", String(k === i)));
   });
 }, { passive: true });
+addEventListener("resize", () => { pager.scrollTo({ left: curTab * pager.clientWidth, behavior: "auto" }); });
 $("#setupBtn").addEventListener("click", () => goTab(2));
+
+function scrollToResult() {
+  const panel = $("#p-read"), r = $("#result");
+  const top = r.getBoundingClientRect().top - panel.getBoundingClientRect().top + panel.scrollTop - 8;
+  panel.scrollTo({ top, behavior: "smooth" });
+}
 
 /* ---------- state -> UI ---------- */
 const chat = $("#chat");
 function refresh() {
   const ready = !!S.engine && !S.busy;
-  $("#go").disabled = !(ready && chat.value.trim().length > 20);
+  const enough = chat.value.trim().length > 20;
+  $("#go").disabled = !(ready && enough);
   $("#bench").disabled = !ready;
-  $("#modelState").textContent = S.engine ? S.modelLabel : "Not loaded";
-  $("#goHint").textContent = S.engine ? "" : "Load a model first. Tap Set up above.";
+  $("#modelState").textContent = S.engine ? S.modelLabel : S.loading ? "Loading…" : "Not loaded";
+  $("#goHint").textContent = S.unsupported ? "This browser can't run the on-device model."
+    : S.loading ? "Loading the model. Please wait."
+    : !S.engine ? "Load a model first. Tap Set up above."
+    : !enough ? "Paste a chat first." : "";
   $("#setupBtn").textContent = S.engine ? "Change" : "Set up";
+  const h = $("#langHint");
+  if (h) {
+    const weak = S.engine && S.lang !== "English" && sizeB(S.modelId) < 3;
+    h.textContent = weak ? `${S.lang} is more accurate with a bigger model. In the Lab tab, try Llama 3.2 3B or Qwen3 4B. Small models may leave some lines in English.` : "";
+    h.classList.toggle("hidden", !weak);
+  }
 }
 function paintCount() {
   $("#count").textContent = chat.value.length.toLocaleString() + " characters";
@@ -138,53 +176,73 @@ async function detectGpu() {
   } catch { return null; }
 }
 function buildModelList() {
-  const all = S.webllm.prebuiltAppConfig.model_list;
-  const list = all.filter((m) => {
-    const id = m.model_id;
-    if (!/gemma|qwen2\.5-(0\.5b|1\.5b|3b)-instruct|llama-3\.2-(1b|3b)|smollm2/i.test(id)) return false;
-    if (/-1k$/i.test(id) || /coder|math/i.test(id)) return false;
-    if (m.vram_required_MB && m.vram_required_MB > 3600) return false;
-    const f16 = /q4f16|q0f16/i.test(id), f32 = /q4f32|q0f32/i.test(id);
-    /* Gemma writes broken text in f16 on many phone GPUs, so Gemma uses f32 only */
-    if (/gemma/i.test(id)) return f32;
-    if (S.hasF16 && f32) return false;
-    if (!S.hasF16 && f16) return false;
-    return true;
-  }).sort((a, b) => (a.vram_required_MB || 0) - (b.vram_required_MB || 0));
+  const all = (S.webllm.prebuiltAppConfig && S.webllm.prebuiltAppConfig.model_list) || [];
+  const seen = new Set(), list = [];
+  for (const m of all) {
+    const id = m.model_id, tier = tierOf(id);
+    if (!tier) continue;
+    if (/vision|jpn|coder|math|embed|-1k$|q0f/i.test(id)) continue;
+    if (m.vram_required_MB && m.vram_required_MB > MAX_VRAM) continue;
+    if ((m.required_features || []).includes("shader-f16") && !S.hasF16) continue;
+    const f16 = /q4f16/i.test(id), f32 = /q4f32/i.test(id);
+    if (/gemma/i.test(id)) { if (!f32) continue; }
+    else if (S.hasF16 ? f32 : f16) continue;
+    const key = prettyName(id);
+    if (seen.has(key)) continue;
+    seen.add(key); list.push({ m, tier });
+  }
+  list.sort((a, b) => a.tier.rank - b.tier.rank || (a.m.vram_required_MB || 0) - (b.m.vram_required_MB || 0));
 
-  const rec = list.find((m) => /llama-3\.2-1b/i.test(m.model_id)) || list.find((m) => /gemma/i.test(m.model_id)) || list[0];
-  const saved = store.get(KEY_MODEL, null);
   const sel = $("#model");
   sel.textContent = "";
-  list.forEach((m) => {
+  if (!list.length) {
+    const o = document.createElement("option"); o.textContent = "No compatible model found"; sel.appendChild(o); return [];
+  }
+  const big = (navigator.deviceMemory || 4) >= 8 ? list.find((x) => /llama-3\.2-3b/i.test(x.m.model_id)) : null;
+  const rec = big || list.find((x) => /llama-3\.2-1b/i.test(x.m.model_id)) || list[0];
+  const saved = store.get(KEY_MODEL, null);
+  list.forEach((x) => {
     const o = document.createElement("option");
-    const gb = m.vram_required_MB ? ` · ${(m.vram_required_MB / 1024).toFixed(1)} GB` : "";
-    o.value = m.model_id;
-    o.textContent = prettyName(m.model_id) + gb + (m === rec ? " (recommended)" : "");
+    const gb = x.m.vram_required_MB ? ` · ${(x.m.vram_required_MB / 1024).toFixed(1)} GB` : "";
+    o.value = x.m.model_id;
+    o.dataset.base = prettyName(x.m.model_id) + gb + " · " + x.tier.tag + (x === rec ? " · Recommended" : "");
+    o.textContent = o.dataset.base;
     sel.appendChild(o);
   });
-  if (!list.length) { const o = document.createElement("option"); o.textContent = "No compatible model found"; sel.appendChild(o); return; }
-  sel.value = list.some((m) => m.model_id === saved) ? saved : rec.model_id;
+  sel.value = list.some((x) => x.m.model_id === saved) ? saved : rec.m.model_id;
   sel.disabled = false;
   $("#load").disabled = false;
   paintHint();
+  return list;
+}
+async function markCached() {
+  if (!S.webllm || !S.webllm.hasModelInCache) return;
+  for (const o of $$("#model option")) {
+    if (!o.value) continue;
+    try { if (await S.webllm.hasModelInCache(o.value)) o.textContent = o.dataset.base + " · downloaded"; } catch {}
+  }
 }
 function paintHint() {
   const id = $("#model").value || "";
-  $("#modelHint").textContent = /gemma/i.test(id)
-    ? "Gemma is Google's open-weight model family. On some phones it can write broken text. If that happens, use Llama 3.2 1B. The first load downloads it once, so use Wi-Fi."
-    : "The first load downloads the model once, so use Wi-Fi. Smaller models are faster but less precise. For better Hindi, try Llama 3.2 3B.";
+  const sz = sizeB(id);
+  let t = /gemma/i.test(id)
+    ? "Gemma is Google's open-weight model family. On some phones it can write broken text. If that happens, use Llama 3.2 1B."
+    : sz < 3
+      ? "Small and fast. Good for English. Hindi and Hinglish can need small corrections."
+      : "Bigger and slower, but much more accurate, especially for Hindi and Hinglish. Needs a phone with 6 GB RAM or more.";
+  t += " The first load downloads the model once, so use Wi-Fi. After that it works offline.";
+  $("#modelHint").textContent = t;
 }
 $("#model").addEventListener("change", paintHint);
 
 /* ---------- load model ---------- */
-$("#load").addEventListener("click", async () => {
-  if (S.busy) return;
-  const id = $("#model").value;
-  S.busy = true; hideNotice(); refresh();
+async function loadModel(id, { auto = false } = {}) {
+  if (S.busy || !id || !S.webllm) return false;
+  S.busy = true; S.loading = true; hideNotice(); refresh();
   $("#load").disabled = true; $("#model").disabled = true;
-  setProgress(0); setStatus("Starting download…");
+  setProgress(0); setStatus(auto ? "Opening your saved model…" : "Starting download…");
   const t0 = performance.now();
+  let ok = false;
   try {
     if (S.engine) { try { await S.engine.unload(); } catch {} S.engine = null; }
     S.engine = await S.webllm.CreateMLCEngine(id, {
@@ -193,22 +251,27 @@ $("#load").addEventListener("click", async () => {
     S.modelId = id; S.modelLabel = prettyName(id);
     S.loadSecs = (performance.now() - t0) / 1000;
     store.set(KEY_MODEL, id);
+    try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch {}
     setProgress(1);
     setStatus(`${S.modelLabel} loaded in ${S.loadSecs.toFixed(1)}s. It now runs on this device.`, true);
     haptic([10, 40, 10]); toast("Model ready");
-    setTimeout(() => goTab(0), 800);
+    if (!auto) setTimeout(() => goTab(0), 800);
+    ok = true;
   } catch (e) {
     console.error(e);
-    S.engine = null;
+    S.engine = null; S.modelId = null;
     setProgress(0); setStatus("");
-    showNotice(String(e && e.message || e).slice(0, 220) + " | The model didn't load. If it keeps failing, choose a smaller model such as Llama 3.2 1B or SmolLM2.");
+    const msg = String((e && e.message) || e).slice(0, 200);
+    showNotice(msg + " | The model didn't load. Try a smaller model such as Llama 3.2 1B, close other apps and tabs, then try again.");
   } finally {
-    S.busy = false;
+    S.busy = false; S.loading = false;
     $("#load").disabled = false; $("#model").disabled = false;
     $("#load").textContent = S.engine ? "Load a different model" : "Download and load model";
-    refresh();
+    refresh(); markCached();
   }
-});
+  return ok;
+}
+$("#load").addEventListener("click", () => loadModel($("#model").value));
 
 /* ---------- input controls ---------- */
 chat.addEventListener("input", paintCount);
@@ -222,24 +285,14 @@ $("#lang").addEventListener("click", (e) => {
   const b = e.target.closest("button[data-lang]"); if (!b) return;
   S.lang = b.dataset.lang; haptic(8);
   $$("#lang button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+  refresh();
 });
 
-/* ---------- inference ---------- */
-async function ask(prompt, { max = 320, onToken } = {}) {
-  const stream = await S.engine.chat.completions.create({
-    messages: [{ role: "user", content: prompt }],
-    stream: true, temperature: 0.2, top_p: 0.9, max_tokens: max,
-    stream_options: { include_usage: true }
-  });
-  let out = "", usage = null, n = 0;
-  for await (const ch of stream) {
-    const d = ch.choices?.[0]?.delta?.content;
-    if (d) { out += d; n++; onToken?.(out); }
-    if (ch.usage) usage = ch.usage;
-    if (S.stopped) { try { S.engine.interruptGenerate(); } catch {} }
-  }
-  return { text: out, usage, chunks: n };
-}
+/* ======================================================================
+   TEXT LOGIC (no model needed)
+   ====================================================================== */
+
+const DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
 
 function splitChat(text, size = 2800) {
   const parts = []; let cur = "";
@@ -256,89 +309,90 @@ function splitChat(text, size = 2800) {
   return parts;
 }
 
-/* the model always writes English first. Hindi and Hinglish come from the translation step below. */
-function format() {
-  return `Write the answer in English. Reply in exactly this format and nothing else:
-GIST: Two short sentences. What the chat is about and where things stand.
-TO DO:
-- One action per line. Say who owns it if the chat makes that clear.
-DATES:
-- Each plan, deadline or time that was mentioned. Write "None" if there are none.
-Keep the labels GIST, TO DO and DATES exactly as written. Use only what is in the chat. Do not invent names, times or amounts.`;
+function normalize(t) {
+  return t.replace(/[\u2018\u2019\u02bc]/g, "'").replace(/[\u201c\u201d]/g, '"')
+    .replace(/[\u200e\u200f\u202a-\u202e\u00a0\u202f]/g, " ").replace(/\r/g, "");
 }
 
-function parse(t) {
-  t = t.replace(/\*\*/g, "").replace(/^#+\s*/gm, "");
-  const g = /GIST:\s*([\s\S]*?)(?=\n\s*TO ?DO:|$)/i.exec(t);
-  const td = /TO ?DO:\s*([\s\S]*?)(?=\n\s*DATES?\b|$)/i.exec(t);
-  const dt = /DATES?[^:\n]*:\s*([\s\S]*)$/i.exec(t);
-  const bullets = (s) => (s || "").split("\n")
-    .map((l) => l.replace(/^\s*(?:[-*•]+|\d+[.)])\s*/, "").trim())
-    .filter((l) => l && !/^none\.?$/i.test(l));
-  return { gist: (g ? g[1] : t).trim().replace(/\s+/g, " "), todo: bullets(td && td[1]), dates: bullets(dt && dt[1]) };
-}
-
-/* ---------- checks for bad model output ---------- */
-/* read the chat into who / message */
-const STAMP = /^\s*(?:\[[^\]]*\]|\(?\d{1,2}[\/.]\d{1,2}[\/.]\d{2,4},?\s*\d{1,2}:\d{2}(?:\s?[ap]m)?\)?\s*-)\s*/i;
+const STAMP = /^\s*(?:\[[^\]]*\]|\(?\d{1,2}[\/.]\d{1,2}[\/.]\d{2,4},?\s*\d{1,2}:\d{2}(?::\d{2})?(?:\s?[ap]m)?\)?\s*-)\s*/i;
+const SKIP_MSG = /^<?(?:media|image|video|audio|sticker|gif|document) omitted>?$|^this message was deleted$|^you deleted this message$|^<attached:/i;
 function readMsgs(text) {
   const msgs = [];
-  const lines = text.split("\n").map((l) => l.replace(/[\u200e\u200f\u202a-\u202e]/g, ""));
+  const lines = text.split("\n");
   const stamped = lines.some((l) => STAMP.test(l));
   for (const raw of lines) {
-    /* in an exported chat, a line with no time stamp continues the message before it */
     if (stamped && !STAMP.test(raw)) {
       if (msgs.length && raw.trim()) msgs[msgs.length - 1].msg += " " + raw.trim();
       continue;
     }
     const m = raw.replace(STAMP, "").match(/^([^:\n]{1,30}):\s*(.+)$/);
-    if (m) msgs.push({ who: m[1].trim(), msg: m[2].trim() });
+    if (m && !SKIP_MSG.test(m[2].trim())) msgs.push({ who: m[1].trim(), msg: m[2].trim() });
   }
   return msgs;
 }
-/* random symbols or random scripts = the model is broken */
+
 function gibberish(g) {
-  if (/<unused|<\|/.test(g)) return true;
+  if (/<unused|<\||<think>/.test(g)) return true;
+  if (/(\b[\w\u0900-\u097F]{2,}\b)(?:\s+\1){3,}/u.test(g)) return true;
   const L = g.match(/\p{L}/gu) || [];
   if (L.length < 8) return false;
   const known = L.filter((c) => /[A-Za-z\u0900-\u097F]/.test(c)).length;
   return (L.length - known) / L.length > 0.05;
 }
-/* English gist must be clean and must not invent numbers */
-function gistOk(g, text, lang) {
+function devRatio(s) {
+  const L = s.match(/\p{L}/gu) || [];
+  return L.filter((c) => /[\u0900-\u097F]/.test(c)).length / (L.length || 1);
+}
+const MONTHS = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
+function inventedNames(g, text) {
+  const low = text.toLowerCase();
+  for (const sent of g.split(/(?<=[.!?])\s+/)) {
+    const ws = sent.match(/[A-Za-z][A-Za-z'-]*/g) || [];
+    for (let i = 1; i < ws.length; i++) {
+      const w = ws[i];
+      if (!/^[A-Z][a-z]{2,}$/.test(w)) continue;
+      const k = w.toLowerCase();
+      if (DAYS.includes(k) || MONTHS.includes(k)) continue;
+      if (!low.includes(k)) return true;
+    }
+  }
+  return false;
+}
+function gistOk(g, text) {
   if (!g || g.length < 12 || gibberish(g)) return false;
-  const L = g.match(/\p{L}/gu) || [];
-  const dev = L.filter((c) => /[\u0900-\u097F]/.test(c)).length / (L.length || 1);
-  if (lang === "Hindi" && dev < 0.4) return false;
-  if (lang !== "Hindi" && dev > 0.1) return false;
-  if (lang === "Hinglish" && !/\b(hai|hain|ka|ki|ke|ko|se|mein|aur|kar|karna|raha|rahe|rahi|liye|tak|hoga|hogi|wala|wali)\b/i.test(g)) return false;
+  if (devRatio(g) > 0.1) return false;
+  const words = g.trim().split(/\s+/).length;
+  if (words < 4 || words > 50) return false;
+  if (/\[\d{1,2}:\d{2}\]|^\w+:\s/.test(g)) return false;
   const seen = new Set(text.match(/\d+/g) || []);
   if ((g.match(/\d+/g) || []).some((n) => !seen.has(n))) return false;
+  if (inventedNames(g, text)) return false;
   return true;
+}
+function firstSentences(s, n) {
+  return s.replace(/^\s*(?:here(?:'s| is)[^:\n]*:|sure[,!.:]?|gist:|summary:)\s*/i, "")
+    .replace(/^["'`]+|["'`]+$/g, "").trim().split(/(?<=[.!?])\s+/).slice(0, n).join(" ").trim();
 }
 function joinNames(a, lang) {
   const and = lang === "Hinglish" ? "aur" : lang === "Hindi" ? "और" : "and";
   if (a.length < 2) return a[0] || "";
   return a.slice(0, -1).join(", ") + " " + and + " " + a[a.length - 1];
 }
-/* safe gist built from the chat itself, in the chosen language */
 function fallbackGist(msgs, nTodo, nDates, lang) {
   const who = joinNames([...new Set(msgs.map((m) => m.who))].slice(0, 4), lang);
   if (lang === "Hindi") return (who ? who + " की चैट। " : "चैट। ") + `${nTodo} काम और ${nDates} योजनाओं या समय का ज़िक्र हुआ।`;
   if (lang === "Hinglish") return (who ? who + " ki chat. " : "Chat. ") + `${nTodo} kaam aur ${nDates} plan ya time ka zikr hua.`;
   return (who ? "Chat between " + who + ". " : "Chat. ") + `${nTodo} tasks and ${nDates} plans or times were mentioned.`;
 }
-const BROKEN_MSG = "Model wrote broken text. Simple summary used. Try Llama 3.2 1B in Lab.";
-const MISS_MSG = (n) => `${n} line${n > 1 ? "s" : ""} stayed in English. Try Llama 3.2 3B for better Hindi.`;
+const BROKEN_MSG = "Model wrote broken text, so a simple summary was used. Try Llama 3.2 1B in Lab.";
+const MISS_MSG = (n) => `${n} line${n > 1 ? "s" : ""} stayed in English. A bigger model (Llama 3.2 3B) translates better.`;
 
-/* ---------- labels in each language ---------- */
 const LBL = {
   English: { todo: "To do", dates: "Dates and plans", noTodo: "Nothing you need to do.", noDates: "No other dates or plans.", copy: "Copy", share: "Share", none: "None", asks: "asks" },
   Hindi: { todo: "करने के काम", dates: "तारीख़ें और योजनाएँ", noTodo: "कोई काम नहीं।", noDates: "कोई अन्य तारीख़ या योजना नहीं।", copy: "कॉपी", share: "शेयर", none: "कोई नहीं", asks: "का अनुरोध" },
   Hinglish: { todo: "Karne wale kaam", dates: "Dates aur plans", noTodo: "Koi kaam nahi.", noDates: "Koi aur date ya plan nahi.", copy: "Copy", share: "Share", none: "Koi nahi", asks: "ka request" }
 };
 
-/* ---------- days and times: a word list, so they are always correct ---------- */
 const L10N = {
   Hindi: {
     days: { monday: "सोमवार", tuesday: "मंगलवार", wednesday: "बुधवार", thursday: "गुरुवार", friday: "शुक्रवार", saturday: "शनिवार", sunday: "रविवार" },
@@ -374,179 +428,108 @@ function whenLocal(piece, lang) {
   return tak ? out + " " + T.tak : out;
 }
 
-/* ---------- translation: the model translates short lines, every line is checked ---------- */
-/* returns the clean line, or null if the line looks wrong (then the English line is kept) */
-function trFix(src, out, lang) {
-  out = (out || "").trim().replace(/^["'`]+|["'`]+$/g, "").replace(/^(?:output|translation|hindi|hinglish)\s*:\s*/i, "")
-    .replace(/[०-९]/g, (d) => "०१२३४५६७८९".indexOf(d));
-  /* the small model sometimes repeats the worked examples instead of translating */
-  const lo = src.toLowerCase();
-  if (TR[lang].ex.some((e) => !lo.includes(e[0]) && out.toLowerCase().includes(e[1].toLowerCase()))) return null;
-  if (!out || out.length > src.length * 4 + 30 || gibberish(out)) return null;
-  const nums = (s) => [...new Set(s.match(/\d+/g) || [])].sort().join(",");
-  if (nums(src) !== nums(out)) return null;
-  const L = out.match(/\p{L}/gu) || [];
-  const dev = L.filter((c) => /[\u0900-\u097F]/.test(c)).length / (L.length || 1);
-  if (lang === "Hindi") return dev >= 0.4 ? out : null;
-  const flat = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, "");
-  return dev === 0 && flat(out) !== flat(src) ? out : null;
-}
-const TR = {
-  Hindi: {
-    sys: "Translate the message from English to Hindi, written in Devanagari script. Keep names, numbers and times exactly as written. Reply with the translation only.",
-    ex: [
-      ["pay the rent", "किराया देना"],
-      ["call the doctor", "डॉक्टर को फ़ोन करना"],
-      ["The chat is about a birthday party planned for Sunday.", "यह चैट रविवार को होने वाली बर्थडे पार्टी की योजना के बारे में है।"]
-    ]
-  },
-  Hinglish: {
-    sys: "Translate the message from English to Hinglish: Hindi written in the Roman alphabet, the way people type on WhatsApp. Keep names, numbers and times exactly as written. Reply with the translation only.",
-    ex: [
-      ["pay the rent", "Rent dena"],
-      ["call the doctor", "Doctor ko call karna"],
-      ["The chat is about a birthday party planned for Sunday.", "Yeh chat Sunday ko hone wali birthday party ki planning ke baare mein hai."]
-    ]
-  }
+/* ---------- exact translation of common short lines ---------- */
+const LEX = {
+  ticket: ["ticket", "टिकट"], tickets: ["tickets", "टिकट"], snack: ["snack", "स्नैक्स"], snacks: ["snacks", "स्नैक्स"],
+  money: ["paise", "पैसे"], cash: ["cash", "कैश"], rent: ["rent", "किराया"], villa: ["villa", "विला"],
+  car: ["car", "कार"], cars: ["cars", "कारें"], cab: ["cab", "कैब"], cabs: ["cabs", "कैब"],
+  speaker: ["speaker", "स्पीकर"], dinner: ["dinner", "डिनर"], lunch: ["lunch", "लंच"], breakfast: ["nashta", "नाश्ता"],
+  food: ["khana", "खाना"], booking: ["booking", "बुकिंग"], confirmation: ["confirmation", "कन्फ़र्मेशन"],
+  printout: ["printout", "प्रिंटआउट"], payment: ["payment", "पेमेंट"], bill: ["bill", "बिल"], doctor: ["doctor", "डॉक्टर"],
+  cake: ["cake", "केक"], gift: ["gift", "गिफ्ट"], gifts: ["gifts", "गिफ्ट"], drinks: ["drinks", "ड्रिंक्स"], water: ["paani", "पानी"],
+  movie: ["movie", "फ़िल्म"], night: ["night", "नाइट"], party: ["party", "पार्टी"], trip: ["trip", "ट्रिप"], meeting: ["meeting", "मीटिंग"],
+  plan: ["plan", "प्लान"], plans: ["plans", "प्लान"], document: ["document", "दस्तावेज़"], documents: ["documents", "दस्तावेज़"],
+  form: ["form", "फ़ॉर्म"], report: ["report", "रिपोर्ट"], photo: ["photo", "फ़ोटो"], photos: ["photos", "फ़ोटो"],
+  list: ["list", "लिस्ट"], location: ["location", "लोकेशन"], address: ["address", "पता"], keys: ["keys", "चाबियाँ"],
+  bag: ["bag", "बैग"], charger: ["charger", "चार्जर"], medicines: ["medicines", "दवाइयाँ"], groceries: ["groceries", "किराने का सामान"],
+  details: ["details", "जानकारी"], message: ["message", "मैसेज"], email: ["email", "ईमेल"],
+  decorations: ["decorations", "सजावट"], balloons: ["balloons", "गुब्बारे"], games: ["games", "गेम्स"],
+  rupees: ["rupaye", "रुपये"], rupee: ["rupaye", "रुपये"], rs: ["rupaye", "रुपये"],
+  and: ["aur", "और"], all: ["sab", "सब"], everyone: ["sab log", "सब लोग"], each: ["har ek", "हर एक"]
 };
-async function translateAll(srcs, lang, hooks, acc) {
-  const cfg = TR[lang], res = [];
-  /* one line per call, examples as earlier chat turns: a 1B model copies numbered examples when lines are batched */
-  for (let i = 0; i < srcs.length; i++) {
-    if (S.stopped) throw new Error("stopped");
-    const s = srcs[i];
-    hooks.onStatus?.(`Translating to ${lang}… ${i + 1} of ${srcs.length}`);
-    const messages = [];
-    cfg.ex.forEach((e, k) => {
-      messages.push({ role: "user", content: (k === 0 ? cfg.sys + "\n\n" : "") + e[0] });
-      messages.push({ role: "assistant", content: e[1] });
-    });
-    messages.push({ role: "user", content: s });
-    const r = await S.engine.chat.completions.create({
-      messages, stream: false, temperature: 0, top_p: 0.9,
-      max_tokens: Math.min(220, (lang === "Hindi" ? 4 : 2) * s.length + 30)
-    });
-    acc.tokens += r.usage?.completion_tokens || 0;
-    const d = r.usage?.extra?.decode_tokens_per_s; if (d) acc.speeds.push(d);
-    res.push(trFix(s, (r.choices?.[0]?.message?.content || "").split("\n")[0], lang));
-  }
-  return res;
-}
-/* translate each different line once. The result is a Map: English line -> translated line (or null) */
-async function trMap(srcs, lang, hooks, acc) {
-  const uniq = [...new Set(srcs.filter(Boolean))];
-  const out = uniq.length ? await translateAll(uniq, lang, hooks, acc) : [];
-  const m = new Map();
-  uniq.forEach((s, i) => m.set(s, out[i]));
-  m.miss = out.filter((x) => !x).length;
-  return m;
-}
+const VERBS = {
+  "book": ["book karna", "बुक करना"], "reserve": ["reserve karna", "रिज़र्व करना"],
+  "bring": ["lana", "लाना"], "get": ["lana", "लाना"], "buy": ["kharidna", "खरीदना"],
+  "send": ["bhejna", "भेजना"], "pay": ["dena", "देना"], "forward": ["forward karna", "फ़ॉरवर्ड करना"],
+  "call": ["call karna", "फ़ोन करना", ["ko", "को"]], "ask": ["puchna", "पूछना", ["se", "से"]],
+  "tell": ["batana", "बताना", ["ko", "को"]], "remind": ["yaad dilana", "याद दिलाना", ["ko", "को"]],
+  "confirm": ["confirm karna", "पुष्टि करना"], "print": ["print karna", "प्रिंट करना"], "share": ["share karna", "साझा करना"],
+  "check": ["check karna", "जाँच करना"], "handle": ["sambhalna", "संभालना"], "arrange": ["arrange karna", "इंतज़ाम करना"],
+  "organize": ["organize karna", "आयोजित करना"], "collect": ["collect karna", "इकट्ठा करना"],
+  "carry": ["le jaana", "ले जाना"], "pick up": ["lena", "लेना"], "take": ["lena", "लेना"], "pack": ["pack karna", "पैक करना"],
+  "cook": ["pakana", "पकाना"], "order": ["order karna", "ऑर्डर करना"], "prepare": ["taiyaar karna", "तैयार करना"],
+  "plan": ["plan karna", "योजना बनाना"], "cancel": ["cancel karna", "रद्द करना"], "reply": ["reply karna", "जवाब देना"],
+  "update": ["update karna", "अपडेट करना"], "submit": ["submit karna", "जमा करना"], "finish": ["khatam karna", "खत्म करना"],
+  "clean": ["saaf karna", "साफ़ करना"], "reach": ["pahunchna", "पहुँचना"], "arrive": ["pahunchna", "पहुँचना"],
+  "come": ["aana", "आना"], "leave": ["nikalna", "निकलना"]
+};
+const DET = new Set(["the", "a", "an", "my", "our", "your", "their", "some"]);
+const FUNC = new Set(["to", "for", "from", "with", "at", "in", "on", "it", "them", "him", "her", "us", "up", "out", "near", "by", "before", "after",
+  "about", "if", "when", "that", "which", "because", "so", "but", "or", "not", "also", "only", "just", "every", "than", "then", "there", "here",
+  "this", "these", "those", "be", "is", "are", "was", "were", "been", "can", "could", "should", "would", "might", "may", "do", "does", "did",
+  "have", "has", "had", "of", "as", "into", "over", "under", "like", "who", "what", "where", "how", "why", "we", "you", "they", "he", "she", "i"]);
+const capFirst = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
-/* ---------- long chats (over 3,500 characters) ---------- */
-async function summarizeLong(text, lang, hooks = {}) {
-  const t0 = performance.now();
-  const acc = { tokens: 0, speeds: [] };
-  const note = (r) => {
-    acc.tokens += r.usage?.completion_tokens || r.chunks;
-    const d = r.usage?.extra?.decode_tokens_per_s; if (d) acc.speeds.push(d);
-  };
-  let source;
-  if (text.length <= 4000) {
-    source = `Here is a group chat:\n\n${text}\n\n${format()}`;
-  } else {
-    let parts = splitChat(text); const notes = [];
-    if (parts.length > 12) { parts = parts.slice(-12); hooks.onWarn?.("Very long chat. Only the latest part was read."); }
-    for (let i = 0; i < parts.length; i++) {
-      if (S.stopped) throw new Error("stopped");
-      hooks.onStatus?.(`Reading part ${i + 1} of ${parts.length}…`);
-      const r = await ask(`Here is part ${i + 1} of ${parts.length} of a group chat:\n\n${parts[i]}\n\nWrite 3 to 6 short bullet notes: key points, decisions, tasks (with who owns them) and any dates or times. Use only what is written.`, { max: 220 });
-      notes.push(r.text.trim());
-      note(r);
-    }
-    source = `Here are notes taken from a long group chat:\n\n${notes.join("\n\n")}\n\n${format()}`;
+function trObj(tokens, lang, names) {
+  const hi = lang === "Hindi", out = [];
+  for (const raw of tokens) {
+    const w = raw.replace(/^[,;:()]+|[,;:()]+$/g, "");
+    if (!w) continue;
+    const k = w.toLowerCase();
+    if (DET.has(k)) continue;
+    if (/^\d[\d,.:]*$/.test(w)) { out.push(w); continue; }
+    if (names.has(k)) { out.push(w); continue; }
+    if (LEX[k]) { out.push(LEX[k][hi ? 1 : 0]); continue; }
+    if (FUNC.has(k) || hi) return null;
+    out.push(w);
   }
-  const r = await ask(source, { max: 360, onToken: hooks.onToken });
-  note(r);
-  const msgs = readMsgs(text);
-  const p = parse(r.text);
-  p.todo = p.todo.slice(0, 7); p.dates = p.dates.slice(0, 6);
-  let fb = false;
-  if (!gistOk(p.gist, text, "English")) {
-    if (gibberish(r.text)) hooks.onWarn?.(BROKEN_MSG);
-    p.gist = fallbackGist(msgs, p.todo.length, p.dates.length, "English"); fb = true;
+  return out;
+}
+function ruleTr(src, lang, names) {
+  if (lang === "English") return null;
+  const s = src.trim().replace(/[.!?।]+$/, "").replace(/^(?:i will|i'll|will|to|please)\s+/i, "");
+  if (!s || /[\u0900-\u097F]/.test(s)) return null;
+  const hi = lang === "Hindi", w = s.split(/\s+/);
+  const two = w.slice(0, 2).join(" ").toLowerCase();
+  const key = VERBS[two] ? two : VERBS[w[0].toLowerCase()] ? w[0].toLowerCase() : null;
+  if (key) {
+    const v = VERBS[key];
+    let rest = w.slice(key.split(" ").length), me = false;
+    if (rest[0] && rest[0].toLowerCase() === "me") { me = true; rest = rest.slice(1); }
+    const obj = trObj(rest, lang, names);
+    if (!obj) return null;
+    const post = v[2] && obj.length ? v[2][hi ? 1 : 0] : "";
+    const parts = [me ? (hi ? "मुझे" : "mujhe") : "", ...obj, post, v[hi ? 1 : 0], hi ? "है" : "hai"].filter(Boolean);
+    return capFirst(parts.join(" "));
   }
-  if (lang !== "English") {
-    const m = await trMap([fb ? "" : p.gist, ...p.todo, ...p.dates], lang, hooks, acc);
-    if (m.miss) hooks.onWarn?.(MISS_MSG(m.miss));
-    const g = fb ? "" : m.get(p.gist);
-    p.gist = g || fallbackGist(msgs, p.todo.length, p.dates.length, lang);
-    p.todo = p.todo.map((s) => m.get(s) || s);
-    p.dates = p.dates.map((s) => m.get(s) || s);
+  if (w.length > 4) return null;
+  const parts = [];
+  for (const raw of w) {
+    const k = raw.toLowerCase();
+    if (DET.has(k)) continue;
+    if (/^\d[\d,.:]*$/.test(raw)) parts.push(raw);
+    else if (names.has(k)) parts.push(raw);
+    else if (LEX[k]) parts.push(LEX[k][hi ? 1 : 0]);
+    else return null;
   }
-  const secs = (performance.now() - t0) / 1000;
-  const speed = acc.speeds.length ? acc.speeds.reduce((a, b) => a + b, 0) / acc.speeds.length : acc.tokens / secs;
-  return { p, tokens: acc.tokens, secs, speed };
+  return parts.length ? capFirst(parts.join(" ")) : null;
 }
 
-/* ---------- summarize: the model finds the gist and tasks in English, rules find the dates, then everything is put into the chosen language ---------- */
-async function summarize(text, lang, hooks = {}) {
-  /* curly quotes (iPhone keyboards) and invisible direction marks (iOS exports) break the word rules */
-  text = text.replace(/[\u2018\u2019\u02bc]/g, "'").replace(/[\u201c\u201d]/g, '"').replace(/[\u200e\u200f\u202a-\u202e]/g, "");
-  if (text.length > 3500) return summarizeLong(text, lang, hooks);
-  const t0 = performance.now();
-  const sys = "You read short chats and answer very briefly. Use only facts written in the chat. Never invent names, days or times. Never copy the chat. Write in English.";
-  const acc = { tokens: 0, speeds: [] };
-  const q = async (instruction, max) => {
-    if (S.stopped) throw new Error("stopped");
-    const r = await S.engine.chat.completions.create({
-      messages: [
-        { role: "system", content: sys },
-        { role: "user", content: "Chat:\n" + text + "\n\n" + instruction }
-      ],
-      stream: false, temperature: 0.1, top_p: 0.9, max_tokens: max,
-      frequency_penalty: 0.6, presence_penalty: 0.3
-    });
-    acc.tokens += r.usage?.completion_tokens || 0;
-    const d = r.usage?.extra?.decode_tokens_per_s; if (d) acc.speeds.push(d);
-    return r.choices?.[0]?.message?.content || "";
-  };
-  const lines = (s) => {
-    const seen = new Set();
-    return s.split("\n")
-      .map((l) => l.trim())
-      .filter((l) => !/^[\s\[\(]*\d{0,2}:\d{2}/.test(l))
-      .map((l) => l.replace(/^(?:[-*•]|\d+[.)])\s*/, "").trim())
-      .filter((l) => l.length > 3 && !/:\s*$/.test(l) && !/^none\b/i.test(l))
-      .filter((l) => { const k = l.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
-  };
-
-  /* 1) read the chat into who / message */
-  const msgs = readMsgs(text);
+/* ---------- facts from the chat (rules only) ---------- */
+function extractRules(text, msgs, modelLines = []) {
   const speakers = new Set(msgs.map((m) => m.who.toLowerCase()));
-
-  /* 2) model: gist and tasks, always in English */
-  hooks.onStatus?.("Finding the gist…");
-  const gistRaw = await q("Write one full sentence of 10 to 20 words saying what this chat is about and what is planned. Name the event and the day if the chat says them. Do not use vague words like details or arrangements. Reply with the sentence only.", 80);
-  hooks.onStatus?.("Finding the tasks…");
-  const todoRaw = await q("List what each person said they will do. One line per task, written as Name: task. Use only names from the chat. At most 6 lines. Reply with the list only.", 120);
-  hooks.onStatus?.("Checking tasks and dates…");
-
-  /* 3) rules: words that name a day or a time, and helpers that clean a message */
   const dayRe = /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|tonight|noon|kal|parso|aaj|subah|shaam|raat|dopahar|baje|somvar|mangalvar|budhvar|guruvar|shukravar|shanivar|ravivar)\b|\b\d{1,2}(:\d{2})?\s?(am|pm|baje)\b|\b\d{1,2}:\d{2}\b|\b\d{1,2}(st|nd|rd|th)\b|कल|परसों|आज|सुबह|शाम|रात|बजे|सोमवार|मंगलवार|बुधवार|गुरुवार|शुक्रवार|शनिवार|रविवार/i;
   const whenRe = /(?:\b(?:on|at|by|before|till|until)\s+)?(?:\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|tonight)\b(?:\s+(?:morning|afternoon|evening|night))?|\b\d{1,2}(?::\d{2})?\s?(?:am|pm)\b|\b\d{1,2}:\d{2}\b)/gi;
-  const clean = (s) => s.replace(/^(?:(?:yes|yeah|yep|yup|ok(?:ay)?|sure|done|great|fine|cool|alright|haan|ha|theek hai|pakka)\b[,.!\s]*)+/i, "").trim();
-  /* the action part of a message: filler words, time words and a starting "I will" removed */
+  const clean = (s) => s.replace(/^(?:(?:yes|yeah|yep|yup|ok(?:ay)?|sure|done|great|fine|cool|alright|agreed|haan|ha|theek hai|pakka)\b[,.!\s]*)+/i, "").trim();
   const core = (msg) => clean(msg.replace(whenRe, ""))
     .replace(/\s+/g, " ").replace(/\s+([.,!?])/g, "$1")
     .replace(/^(i will|i'll|i am going to|i'm going to)\s+/i, "")
     .replace(/[,.!? ]+$/, "").trim();
   const whenOf = (msg) => (msg.match(whenRe) || []).map((x) => x.trim().replace(/^(?:on|at)\s+/i, ""));
-  /* one entry per sentence, so "I can come, but I will be late. Will reach by 8:30." is read as two things */
+
   const items = [];
   for (const m of msgs) for (const t of m.msg.split(/(?<=[.!?])\s+/)) if (t.trim()) items.push({ who: m.who, msg: t.trim() });
 
-  /* 4) tasks: "I will ...", then requests ("please ..."), then model tasks that name a real speaker and are not repeats */
-  const willRe = /\b(i will|i'll|i am going to|i'm going to)\b|\b\w+(unga|ungi)\b/i;
   const stop = new Set(["the", "and", "for", "you", "with", "from", "that", "this", "will", "are", "was", "has", "have", "sunday", "saturday", "morning", "evening", "please", "pick"]);
   const words = (s) => new Set(s.toLowerCase().match(/[a-z]{4,}/g)?.filter((w) => !stop.has(w)) || []);
   const similar = (a, b) => {
@@ -555,13 +538,15 @@ async function summarize(text, lang, hooks = {}) {
     let n = 0; A.forEach((w) => { if (B.has(w)) n++; });
     return n >= 1 && n / Math.min(A.size, B.size) >= 0.3;
   };
-  const todo = []; /* { who, what, when[], ask } */
+  const todo = [];
   const taken = (what) => todo.some((x) => similar(x.what, what));
+  const willRe = /\b(i will|i'll|i am going to|i'm going to)\b|\b\w+(unga|ungi)\b/i;
   const WILL = /\b(?:i will|i'll|i am going to|i'm going to)\s+/i;
+
   for (const m of items) {
     const c = clean(m.msg);
     if (!willRe.test(c)) continue;
-    if (/\b(i will|i'll)\s+be\b/i.test(c)) continue; /* "I will be late" is not a task */
+    if (/\b(i will|i'll)\s+be\b/i.test(c)) continue;
     const wm = WILL.exec(m.msg);
     const what = core(wm ? m.msg.slice(wm.index + wm[0].length) : m.msg);
     if (what) todo.push({ who: m.who, what, when: whenOf(m.msg), ask: false });
@@ -574,53 +559,206 @@ async function summarize(text, lang, hooks = {}) {
     const owner = r[1] && speakers.has(r[1].toLowerCase()) ? r[1] : null;
     todo.push({ who: owner || m.who, what, when: whenOf(m.msg), ask: !owner });
   }
-  for (const l of lines(todoRaw)) {
+  for (const l of modelLines) {
     const i = l.indexOf(":");
     if (i < 1) continue;
     const who = l.slice(0, i).trim(), what = l.slice(i + 1).trim().replace(/[,.! ]+$/, "");
     if (speakers.size && !speakers.has(who.toLowerCase())) continue;
-    if (!what || taken(what)) continue;
+    if (!what || what.length > 90 || gibberish(what) || taken(what)) continue;
     todo.push({ who, what, when: [], ask: false });
   }
 
-  /* 5) dates: pull the chat lines that name a day or a time (nothing is invented) */
   const pool = msgs.length ? items : text.split(/[\n.!?]+/).map((s) => ({ who: "", msg: s.replace(STAMP, "").trim() })).filter((m) => m.msg);
-  const dates = [], seenD = new Set(); /* { who, what, when[] } */
+  const dates = [], seenD = new Set();
   for (const m of pool) {
     if (!dayRe.test(m.msg)) continue;
     const when = whenOf(m.msg);
     let what = (when.length ? core(m.msg) : "") || clean(m.msg).replace(/[,.!? ]+$/, "");
-    if (taken(what)) continue; /* already shown under To do */
+    if (taken(what)) continue;
     if (what.length > 90) what = what.slice(0, 87) + "…";
     const key = (when.join() + what).toLowerCase();
     if (seenD.has(key)) continue;
     seenD.add(key);
     dates.push({ who: m.who, what, when });
   }
+  return { todo, dates };
+}
 
-  const T = todo.slice(0, lang === "English" ? 7 : 6), D = dates.slice(0, lang === "English" ? 6 : 5);
+/* ======================================================================
+   MODEL CALLS
+   ====================================================================== */
 
-  /* 6) English gist: check it. If it is broken or has invented numbers, use a safe gist */
-  let gist = lines(gistRaw).slice(0, 2).join(" ");
+const stripThink = (s) => s.replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/<think>[\s\S]*$/i, "").trim();
+async function gen(messages, max, acc, { temp = 0.1, penalty = false } = {}) {
+  if (S.stopped) throw new Error("stopped");
+  const id = S.modelId || "";
+  const q3 = /qwen3/i.test(id);
+  let ms = messages.map((m) => ({ ...m }));
+  if (/gemma/i.test(id) && ms[0] && ms[0].role === "system") {
+    const sys = ms.shift(); if (ms[0]) ms[0].content = sys.content + "\n\n" + ms[0].content;
+  }
+  if (q3) { const last = ms[ms.length - 1]; last.content += " /no_think"; }
+  const req = { messages: ms, stream: false, temperature: temp, top_p: 0.9, max_tokens: max };
+  if (penalty) { req.frequency_penalty = 0.6; req.presence_penalty = 0.3; }
+  if (q3) req.extra_body = { enable_thinking: false };
+  const r = await S.engine.chat.completions.create(req);
+  acc.tokens += r.usage?.completion_tokens || 0;
+  const d = r.usage?.extra?.decode_tokens_per_s; if (d) acc.speeds.push(d);
+  return stripThink(r.choices?.[0]?.message?.content || "");
+}
+
+/* ---------- translation ---------- */
+const TR = {
+  Hindi: {
+    sys: "Translate the message from English to Hindi, written in Devanagari script. Keep people's names, numbers and times exactly as written, with names in English letters. Do not add or remove information. Reply with the translation only.",
+    ex: [
+      ["Aman will pay the rent on Monday.", "Aman सोमवार को किराया देगा।"],
+      ["Call the doctor.", "डॉक्टर को फ़ोन करना।"],
+      ["The chat is about a birthday party planned for Sunday.", "यह चैट रविवार को होने वाली बर्थडे पार्टी की योजना के बारे में है।"]
+    ]
+  },
+  Hinglish: {
+    sys: "Translate the message from English to Hinglish: Hindi written in the Roman alphabet, the way people type on WhatsApp. Keep people's names, numbers and times exactly as written. Do not add or remove information. Reply with the translation only.",
+    ex: [
+      ["Aman will pay the rent on Monday.", "Aman Monday ko rent dega."],
+      ["Call the doctor.", "Doctor ko call karna."],
+      ["The chat is about a birthday party planned for Sunday.", "Yeh chat Sunday ko hone wali birthday party ki planning ke baare mein hai."]
+    ]
+  }
+};
+const HINGLISH_WORDS = /\b(hai|hain|ka|ki|ke|ko|se|mein|me|aur|karna|kar|yeh|ye|woh|ne|par|pe|tak|liye|wala|wali|hoga|hogi|raha|rahe|rahi|nahi|bhi|ho|hua|hone|\w+(?:ega|egi|enge|unga|ungi))\b/i;
+function keeps(src, out, lang, names) {
+  const lo = out.toLowerCase();
+  const ws = src.match(/[A-Za-z][A-Za-z'-]*/g) || [];
+  const okWords = ws.every((w, i) => {
+    const k = w.toLowerCase();
+    if (DAYS.includes(k)) return lang === "Hindi" ? lo.includes(k) || lo.includes(L10N.Hindi.days[k]) : lo.includes(k);
+    if (names.has(k) || (i > 0 && /^[A-Z][a-z]/.test(w))) return lo.includes(k);
+    return true;
+  });
+  if (!okWords) return false;
+  if (lang === "Hindi") {
+    const srcLow = src.toLowerCase();
+    if ((out.match(/[A-Za-z]{3,}/g) || []).some((w) => !srcLow.includes(w.toLowerCase()))) return false;
+  }
+  return true;
+}
+function trFix(src, out, lang, names) {
+  out = (out || "").trim().replace(/^["'`]+|["'`]+$/g, "").replace(/^(?:output|translation|hindi|hinglish)\s*:\s*/i, "")
+    .replace(/[०-९]/g, (d) => "०१२३४५६७८९".indexOf(d));
+  if (!out || out.length > src.length * 4 + 30 || gibberish(out)) return null;
+  const lo = src.toLowerCase();
+  if (TR[lang].ex.some((e) => !lo.includes(e[0].toLowerCase().replace(/[.!?]$/, "")) && out.toLowerCase().includes(e[1].toLowerCase().replace(/[।.]$/, "")))) return null;
+  const nums = (s) => [...new Set(s.match(/\d+/g) || [])].sort().join(",");
+  if (nums(src) !== nums(out)) return null;
+  if (!keeps(src, out, lang, names)) return null;
+  const dev = devRatio(out);
+  if (lang === "Hindi") return dev >= 0.4 ? out : null;
+  if (dev !== 0) return null;
+  const flat = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  if (flat(out) === flat(src)) return null;
+  if (out.split(/\s+/).length >= 4 && !HINGLISH_WORDS.test(out)) return null;
+  return out;
+}
+async function translateAll(srcs, lang, hooks, acc, names) {
+  const cfg = TR[lang], res = [];
+  for (let i = 0; i < srcs.length; i++) {
+    if (S.stopped) throw new Error("stopped");
+    const s = srcs[i];
+    hooks.onStatus?.(`Translating to ${lang}… ${i + 1} of ${srcs.length}`);
+    const messages = [];
+    cfg.ex.forEach((e, k) => {
+      messages.push({ role: "user", content: (k === 0 ? cfg.sys + "\n\n" : "") + e[0] });
+      messages.push({ role: "assistant", content: e[1] });
+    });
+    messages.push({ role: "user", content: s });
+    const out = await gen(messages, Math.min(240, (lang === "Hindi" ? 4 : 2) * s.length + 40), acc, { temp: 0 });
+    res.push(trFix(s, out.split("\n")[0], lang, names));
+  }
+  return res;
+}
+async function trMap(srcs, lang, hooks, acc, names) {
+  const uniq = [...new Set(srcs.filter(Boolean))];
+  const m = new Map(), need = [];
+  for (const s of uniq) { const r = ruleTr(s, lang, names); if (r) m.set(s, r); else need.push(s); }
+  if (need.length) {
+    const out = await translateAll(need, lang, hooks, acc, names);
+    need.forEach((s, i) => m.set(s, out[i]));
+  }
+  m.miss = need.filter((s) => !m.get(s)).length;
+  return m;
+}
+
+/* ---------- summarize ---------- */
+async function summarize(text, lang, hooks = {}) {
+  text = normalize(text);
+  const t0 = performance.now();
+  const acc = { tokens: 0, speeds: [] };
+  const sys = "You read chats and answer very briefly. Use only facts written in the chat. Never invent names, days or times. Never copy the chat. Write in English.";
+  const lines = (s) => {
+    const seen = new Set();
+    return s.split("\n")
+      .map((l) => l.trim())
+      .filter((l) => !/^[\s\[\(]*\d{0,2}:\d{2}/.test(l))
+      .map((l) => l.replace(/^(?:[-*•]|\d+[.)])\s*/, "").replace(/\*\*/g, "").trim())
+      .filter((l) => l.length > 3 && !/:\s*$/.test(l) && !/^none\b/i.test(l))
+      .filter((l) => { const k = l.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; });
+  };
+
+  const msgs = readMsgs(text);
+  const names = new Set(msgs.map((m) => m.who.toLowerCase()));
+
+  const dev = devRatio(text);
+  const direct = dev > 0.15 ? 1400 : 3500, chunk = dev > 0.15 ? 900 : 2800;
+  let ctx = text, label = "Chat:";
+  if (text.length > direct) {
+    let parts = splitChat(text, chunk);
+    if (parts.length > 12) { parts = parts.slice(-12); hooks.onWarn?.("Very long chat. Only the latest part was read."); }
+    const notes = [];
+    for (let i = 0; i < parts.length; i++) {
+      hooks.onStatus?.(`Reading part ${i + 1} of ${parts.length}…`);
+      const n = await gen([
+        { role: "system", content: sys },
+        { role: "user", content: `Part ${i + 1} of ${parts.length} of a group chat:\n\n${parts[i]}\n\nWrite 3 to 6 short bullet notes: key points, decisions, tasks (Name: task) and any days or times. Use only what is written.` }
+      ], 220, acc, { penalty: true });
+      notes.push(n);
+    }
+    ctx = notes.join("\n"); label = "Notes from a long chat:";
+  }
+  const q = (instruction, max) => gen([
+    { role: "system", content: sys },
+    { role: "user", content: `${label}\n${ctx}\n\n${instruction}` }
+  ], max, acc, { penalty: true });
+
+  hooks.onStatus?.("Finding the gist…");
+  const gistRaw = await q("Write one full sentence of 10 to 20 words saying what this chat is about and what is planned. Name the event and the day if the chat says them. Do not use vague words like details or arrangements. Reply with the sentence only.", 80);
+  hooks.onStatus?.("Finding the tasks…");
+  const todoRaw = await q("List what each person said they will do. One line per task, written as Name: task. Use only names from the chat. At most 6 lines. Reply with the list only.", 120);
+  hooks.onStatus?.("Checking tasks and dates…");
+
+  const rules = extractRules(text, msgs, lines(todoRaw));
+  const N = lang === "English" ? [7, 6] : [6, 5];
+  const T = rules.todo.slice(-N[0]), D = rules.dates.slice(-N[1]);
+
+  let gist = firstSentences(lines(gistRaw).join(" "), 2);
   let fb = false;
-  if (!gistOk(gist, text, "English")) {
+  if (!gistOk(gist, text)) {
     if (gibberish(gistRaw)) hooks.onWarn?.(BROKEN_MSG);
     gist = fallbackGist(msgs, T.length, D.length, "English"); fb = true;
   }
 
-  /* 7) translate the gist and the action lines (each different line once) */
   let tr = (s) => s;
   if (lang !== "English") {
-    const m = await trMap([fb ? "" : gist, ...T.map((x) => x.what), ...D.map((x) => x.what)], lang, hooks, acc);
-    if (m.miss) hooks.onWarn?.(MISS_MSG(m.miss));
+    const m = await trMap([...T.map((x) => x.what), ...D.map((x) => x.what)], lang, hooks, acc, names);
+    let miss = m.miss;
     tr = (s) => m.get(s) || s;
-    const g = fb ? "" : m.get(gist);
+    let g = null;
+    if (!fb) { g = (await translateAll([gist], lang, hooks, acc, names))[0]; if (!g) miss++; }
     gist = g || fallbackGist(msgs, T.length, D.length, lang);
+    if (miss) hooks.onWarn?.(MISS_MSG(miss));
   }
 
-  /* 8) build the final lines. Days and times come from the word list. */
   const LB = LBL[lang];
-  const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
   const whenStr = (arr) => arr.map((x) => whenLocal(x, lang)).join(", ");
   const todoOut = T.map((x) => {
     const w = whenStr(x.when);
@@ -629,11 +767,11 @@ async function summarize(text, lang, hooks = {}) {
   const datesOut = D.map((x) => {
     const w = whenStr(x.when);
     const body = `${x.who ? x.who + ": " : ""}${tr(x.what)}`;
-    return w ? `${cap(w)} — ${body}` : body;
+    return w ? `${capFirst(w)} — ${body}` : body;
   });
 
   const secs = (performance.now() - t0) / 1000;
-  const speed = acc.speeds.length ? acc.speeds.reduce((a, b) => a + b, 0) / acc.speeds.length : acc.tokens / secs;
+  const speed = acc.speeds.length ? acc.speeds.reduce((a, b) => a + b, 0) / acc.speeds.length : acc.tokens / Math.max(secs, 0.1);
   return { p: { gist, todo: todoOut, dates: datesOut }, tokens: acc.tokens, secs, speed };
 }
 
@@ -689,20 +827,25 @@ $("#go").addEventListener("click", async () => {
   $("#out").classList.add("hidden"); $("#stats").classList.add("hidden");
   live.classList.add("hidden"); live.textContent = ""; skel.classList.remove("hidden");
   $("#go").classList.add("hidden"); $("#stop").classList.remove("hidden");
-  $("#result").scrollIntoView({ behavior: "smooth", block: "start" });
+  scrollToResult();
   const show = (m) => { skel.classList.add("hidden"); live.classList.remove("hidden"); live.textContent = m; };
-  let warn = "";
+  const warns = [];
   try {
-    const r = await summarize(text, lang, { onStatus: show, onToken: show, onWarn: (m) => { warn = m; } });
+    const r = await summarize(text, lang, { onStatus: show, onWarn: (m) => { if (!warns.includes(m)) warns.push(m); } });
     if (S.stopped) { $("#result").classList.add("hidden"); }
     else {
       showResult(r.p, r, lang); addSaved(r.p, lang); haptic([10, 40, 10]);
-      if (warn) toast(warn, 4500);
+      if (warns.length) toast(warns.join(" "), 5000);
     }
   } catch (e) {
     console.error(e);
     $("#result").classList.add("hidden");
-    if (!S.stopped) readNotice("Something went wrong while reading the chat. Try a shorter chat, or reload the model in the Lab tab.");
+    if (!S.stopped) {
+      const m = String((e && e.message) || e);
+      readNotice(/memory|device lost|out of|allocation/i.test(m)
+        ? "The phone ran out of memory. Close other apps and tabs, or load a smaller model in the Lab tab."
+        : "Something went wrong while reading the chat. Try a shorter chat, or reload the model in the Lab tab.");
+    }
   } finally {
     S.busy = false;
     $("#stop").classList.add("hidden"); $("#go").classList.remove("hidden");
@@ -715,7 +858,8 @@ $("#stop").addEventListener("click", () => { S.stopped = true; try { S.engine.in
 function asText() {
   const LB = LBL[S.shownLang] || LBL.English;
   const li = (id) => $$(id + " li span").map((s) => "- " + s.textContent).join("\n");
-  return `${$("#gist").textContent}\n\n${LB.todo}\n${li("#todo") || "- " + LB.none}\n\n${LB.dates}\n${li("#dates") || "- " + LB.none}`;
+  const clean = (id) => $(id + " li p.empty") ? "" : li(id);
+  return `${$("#gist").textContent}\n\n${LB.todo}\n${clean("#todo") || "- " + LB.none}\n\n${LB.dates}\n${clean("#dates") || "- " + LB.none}`;
 }
 $("#copy").addEventListener("click", async () => {
   try { await navigator.clipboard.writeText(asText()); toast("Copied"); haptic(8); } catch { toast("Copy failed"); }
@@ -736,7 +880,7 @@ function addSaved(p, lang = S.lang) {
 function renderSaved() {
   const q = $("#q").value.trim().toLowerCase();
   const all = store.get(KEY_SAVED, []);
-  const list = q ? all.filter((x) => (x.title + " " + x.gist + " " + x.todo.join(" ")).toLowerCase().includes(q)) : all;
+  const list = q ? all.filter((x) => ((x.title || "") + " " + (x.gist || "") + " " + (x.todo || []).join(" ")).toLowerCase().includes(q)) : all;
   const box = $("#saved"); box.textContent = "";
   $("#wipe").classList.toggle("hidden", !all.length);
   if (!list.length) {
@@ -759,9 +903,9 @@ function renderSaved() {
 function openSaved(el) {
   const x = store.get(KEY_SAVED, []).find((v) => v.id === +el.dataset.id);
   if (!x) return;
-  showResult({ gist: x.gist, todo: x.todo, dates: x.dates }, null, x.lang || "English");
+  showResult({ gist: x.gist, todo: x.todo || [], dates: x.dates || [] }, null, x.lang || "English");
   goTab(0);
-  $("#result").scrollIntoView({ behavior: "smooth", block: "start" });
+  setTimeout(scrollToResult, 350);
 }
 $("#saved").addEventListener("click", (e) => {
   const del = e.target.closest("[data-del]");
@@ -786,7 +930,7 @@ function renderBench() {
   const tb = $("#rows"); tb.textContent = "";
   rows.forEach((r) => {
     const tr = document.createElement("tr");
-    [r.model, r.load != null ? r.load.toFixed(1) + " s" : "-", r.tps.toFixed(1), r.secs.toFixed(1) + " s"].forEach((v) => {
+    [r.model, r.load != null ? r.load.toFixed(1) + " s" : "-", (r.tps || 0).toFixed(1), (r.secs || 0).toFixed(1) + " s"].forEach((v) => {
       const td = document.createElement("td"); td.textContent = v; tr.appendChild(td);
     });
     tb.appendChild(tr);
@@ -817,7 +961,7 @@ $("#exportMd").addEventListener("click", async () => {
   const md = [
     "| Model | Load (s) | Tokens/s | Total (s) |",
     "|---|---|---|---|",
-    ...rows.map((r) => `| ${r.model} | ${r.load != null ? r.load.toFixed(1) : "-"} | ${r.tps.toFixed(1)} | ${r.secs.toFixed(1)} |`)
+    ...rows.map((r) => `| ${r.model} | ${r.load != null ? r.load.toFixed(1) : "-"} | ${(r.tps || 0).toFixed(1)} | ${(r.secs || 0).toFixed(1)} |`)
   ].join("\n");
   try { await navigator.clipboard.writeText(md); toast("Copied as Markdown"); } catch { toast("Copy failed"); }
 });
@@ -826,6 +970,7 @@ $("#clearBench").addEventListener("click", () => { store.set(KEY_BENCH, []); ren
 /* ---------- install + service worker + share target ---------- */
 let deferredInstall = null;
 addEventListener("beforeinstallprompt", (e) => { e.preventDefault(); deferredInstall = e; $("#install").classList.remove("hidden"); });
+addEventListener("appinstalled", () => { deferredInstall = null; $("#install").classList.add("hidden"); });
 $("#installBtn").addEventListener("click", async () => {
   if (!deferredInstall) return;
   deferredInstall.prompt();
@@ -833,7 +978,8 @@ $("#installBtn").addEventListener("click", async () => {
   deferredInstall = null; $("#install").classList.add("hidden");
 });
 if ("serviceWorker" in navigator) {
-  addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {}));
+  const reg = () => navigator.serviceWorker.register("sw.js").catch(() => {});
+  if (document.readyState === "complete") reg(); else addEventListener("load", reg);
 }
 async function takeShared() {
   const q = new URLSearchParams(location.search);
@@ -853,23 +999,40 @@ async function takeShared() {
 }
 
 /* ---------- boot ---------- */
+async function importEngine() {
+  let last;
+  for (const u of ENGINE_URLS) {
+    try { return await import(u); } catch (e) { last = e; console.warn("engine import failed", u, e); }
+  }
+  throw last;
+}
 (async function boot() {
   paintCount(); renderSaved(); renderBench(); takeShared();
   setStatus("Checking your device…");
   const gpu = await detectGpu();
   if (!gpu) {
-    setStatus("");
-    showNotice("This browser does not support WebGPU, which the on-device model needs. Open this page in a recent Chrome on Android (version 121 or newer) and make sure Chrome is up to date.");
-    $("#model").textContent = ""; const o = document.createElement("option"); o.textContent = "Not supported on this browser"; $("#model").appendChild(o);
+    S.unsupported = true; setStatus(""); refresh();
+    const msg = "This browser does not support WebGPU, which the on-device model needs. Open this page in a recent Chrome on Android (version 121 or newer) and update Chrome.";
+    showNotice(msg); readNotice(msg);
+    const sel = $("#model"); sel.textContent = "";
+    const o = document.createElement("option"); o.textContent = "Not supported on this browser"; sel.appendChild(o);
     return;
   }
   try {
-    S.webllm = await import(ENGINE_URL);
-    buildModelList();
-    setStatus("Pick a model and load it. You only do this once per device.");
+    S.webllm = await importEngine();
   } catch (e) {
-    console.error(e);
-    setStatus("");
-    showNotice("Couldn't load the model engine. Check your connection and reload the page.");
+    console.error(e); setStatus("");
+    const msg = "Couldn't load the model engine. Check your connection and reload the page.";
+    showNotice(msg); readNotice(msg);
+    return;
+  }
+  const list = buildModelList();
+  setStatus("Pick a model and load it. You only do this once per device.");
+  await markCached();
+  const saved = store.get(KEY_MODEL, null);
+  if (saved && list.some((x) => x.m.model_id === saved)) {
+    try {
+      if (S.webllm.hasModelInCache && await S.webllm.hasModelInCache(saved)) { $("#model").value = saved; paintHint(); loadModel(saved, { auto: true }); }
+    } catch {}
   }
 })();
