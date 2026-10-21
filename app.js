@@ -11,7 +11,7 @@ const KEY_MODEL = "slowly.model";
 
 const S = {
   webllm: null, engine: null, modelId: null, modelLabel: "", loadSecs: null,
-  busy: false, hasF16: false, stopped: false, lang: "English"
+  busy: false, hasF16: false, stopped: false, lang: "English", shownLang: "English"
 };
 
 const SAMPLE = `[09:12] Aarav: Guys, are we still doing the Lonavala trip this Saturday?
@@ -58,7 +58,7 @@ function toast(msg, ms = 1800) {
 function haptic(p = 10) { try { navigator.vibrate && navigator.vibrate(p); } catch {} }
 function showNotice(msg) { const n = $("#notice"); n.textContent = msg; n.classList.remove("hidden"); }
 function hideNotice() { $("#notice").classList.add("hidden"); }
-/* FIX: the red box #notice lives in the Lab tab, so Read-tab errors were never seen. This one is on the Read tab. */
+/* the red box #notice lives in the Lab tab, so Read-tab errors need their own box on the Read tab */
 function readNotice(msg) {
   let n = $("#readNotice");
   if (!n) {
@@ -145,14 +145,13 @@ function buildModelList() {
     if (/-1k$/i.test(id) || /coder|math/i.test(id)) return false;
     if (m.vram_required_MB && m.vram_required_MB > 3600) return false;
     const f16 = /q4f16|q0f16/i.test(id), f32 = /q4f32|q0f32/i.test(id);
-    /* FIX: Gemma writes broken text in f16 on many phone GPUs, so Gemma uses f32 only */
+    /* Gemma writes broken text in f16 on many phone GPUs, so Gemma uses f32 only */
     if (/gemma/i.test(id)) return f32;
     if (S.hasF16 && f32) return false;
     if (!S.hasF16 && f16) return false;
     return true;
   }).sort((a, b) => (a.vram_required_MB || 0) - (b.vram_required_MB || 0));
 
-  /* FIX: recommend Llama 3.2 1B (it works on your phone), Gemma is still in the list */
   const rec = list.find((m) => /llama-3\.2-1b/i.test(m.model_id)) || list.find((m) => /gemma/i.test(m.model_id)) || list[0];
   const saved = store.get(KEY_MODEL, null);
   const sel = $("#model");
@@ -174,7 +173,7 @@ function paintHint() {
   const id = $("#model").value || "";
   $("#modelHint").textContent = /gemma/i.test(id)
     ? "Gemma is Google's open-weight model family. On some phones it can write broken text. If that happens, use Llama 3.2 1B. The first load downloads it once, so use Wi-Fi."
-    : "The first load downloads the model once, so use Wi-Fi. Smaller models are faster but less precise.";
+    : "The first load downloads the model once, so use Wi-Fi. Smaller models are faster but less precise. For better Hindi, try Llama 3.2 3B.";
 }
 $("#model").addEventListener("change", paintHint);
 
@@ -188,7 +187,6 @@ $("#load").addEventListener("click", async () => {
   const t0 = performance.now();
   try {
     if (S.engine) { try { await S.engine.unload(); } catch {} S.engine = null; }
-    /* FIX: removed the sliding_window_size override for Gemma (it was a guess and can break the output) */
     S.engine = await S.webllm.CreateMLCEngine(id, {
       initProgressCallback: (r) => { setProgress(r.progress || 0); setStatus(r.text || "Loading…"); }
     });
@@ -253,10 +251,9 @@ function splitChat(text, size = 3200) {
   return parts;
 }
 
-function format(lang) {
-  const L = lang === "Hinglish" ? "Hinglish (Hindi written in the Roman alphabet, mixed with simple English)"
-    : lang === "Hindi" ? "Hindi (Devanagari script)" : "English";
-  return `Write the answer in ${L}. Reply in exactly this format and nothing else:
+/* the model always writes English first. Hindi and Hinglish come from the translation step below. */
+function format() {
+  return `Write the answer in English. Reply in exactly this format and nothing else:
 GIST: Two short sentences. What the chat is about and where things stand.
 TO DO:
 - One action per line. Say who owns it if the chat makes that clear.
@@ -276,7 +273,7 @@ function parse(t) {
   return { gist: (g ? g[1] : t).trim().replace(/\s+/g, " "), todo: bullets(td && td[1]), dates: bullets(dt && dt[1]) };
 }
 
-/* ---------- checks for bad model output (new) ---------- */
+/* ---------- checks for bad model output ---------- */
 /* read the chat into who / message */
 const STAMP = /^\s*(?:\[[^\]]*\]|\(?\d{1,2}[\/.]\d{1,2}[\/.]\d{2,4},?\s*\d{1,2}:\d{2}(?:\s?[ap]m)?\)?\s*-)\s*/i;
 function readMsgs(text) {
@@ -295,7 +292,7 @@ function gibberish(g) {
   const known = L.filter((c) => /[A-Za-z\u0900-\u097F]/.test(c)).length;
   return (L.length - known) / L.length > 0.05;
 }
-/* gist must be clean, in the right language, and must not invent numbers */
+/* English gist must be clean and must not invent numbers */
 function gistOk(g, text, lang) {
   if (!g || g.length < 12 || gibberish(g)) return false;
   const L = g.match(/\p{L}/gu) || [];
@@ -320,14 +317,130 @@ function fallbackGist(msgs, nTodo, nDates, lang) {
   return (who ? "Chat between " + who + ". " : "Chat. ") + `${nTodo} tasks and ${nDates} plans or times were mentioned.`;
 }
 const BROKEN_MSG = "Model wrote broken text. Simple summary used. Try Llama 3.2 1B in Lab.";
+const MISS_MSG = (n) => `${n} line${n > 1 ? "s" : ""} stayed in English. Try Llama 3.2 3B for better Hindi.`;
 
+/* ---------- labels in each language ---------- */
+const LBL = {
+  English: { todo: "To do", dates: "Dates and plans", noTodo: "Nothing you need to do.", noDates: "No dates or plans mentioned.", copy: "Copy", share: "Share", none: "None", asks: "asks" },
+  Hindi: { todo: "करने के काम", dates: "तारीख़ें और योजनाएँ", noTodo: "कोई काम नहीं।", noDates: "कोई तारीख़ या योजना नहीं।", copy: "कॉपी", share: "शेयर", none: "कोई नहीं", asks: "का अनुरोध" },
+  Hinglish: { todo: "Karne wale kaam", dates: "Dates aur plans", noTodo: "Koi kaam nahi.", noDates: "Koi date ya plan nahi.", copy: "Copy", share: "Share", none: "Koi nahi", asks: "ka request" }
+};
+
+/* ---------- days and times: a word list, so they are always correct ---------- */
+const L10N = {
+  Hindi: {
+    days: { monday: "सोमवार", tuesday: "मंगलवार", wednesday: "बुधवार", thursday: "गुरुवार", friday: "शुक्रवार", saturday: "शनिवार", sunday: "रविवार" },
+    today: "आज", tomorrow: "कल", tonight: "आज रात", morning: "सुबह", afternoon: "दोपहर", evening: "शाम", night: "रात", baje: "बजे", tak: "तक"
+  },
+  Hinglish: {
+    days: { monday: "Monday", tuesday: "Tuesday", wednesday: "Wednesday", thursday: "Thursday", friday: "Friday", saturday: "Saturday", sunday: "Sunday" },
+    today: "aaj", tomorrow: "kal", tonight: "aaj raat", morning: "subah", afternoon: "dopahar", evening: "shaam", night: "raat", baje: "baje", tak: "tak"
+  }
+};
+function partOfDay(h, ap) {
+  if (ap === "pm" && h < 12) h += 12;
+  if (ap === "am" && h === 12) h = 0;
+  if (h >= 5 && h < 12) return "morning";
+  if (h >= 12 && h < 16) return "afternoon";
+  if (h >= 16 && h < 19) return "evening";
+  return "night";
+}
+const WHEN_TOK = /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|\b(today|tomorrow|tonight)\b|\b(morning|afternoon|evening|night)\b|\b(\d{1,2})(?::(\d{2}))?\s?(am|pm)?\b/gi;
+function whenLocal(piece, lang) {
+  if (lang === "English") return piece;
+  const T = L10N[lang];
+  let tak = false;
+  const p = piece.trim().replace(/^(?:(by|before|till|until)|on|at)\s+/i, (m, g) => { if (g) tak = true; return ""; });
+  const out = p.replace(WHEN_TOK, (m, day, rel, part, h, mi, ap) => {
+    if (day) return T.days[day.toLowerCase()];
+    if (rel) return T[rel.toLowerCase()];
+    if (part) return T[part.toLowerCase()];
+    const time = mi ? h + ":" + mi : h;
+    const pd = ap ? T[partOfDay(+h, ap.toLowerCase())] + " " : "";
+    return pd + time + " " + T.baje;
+  });
+  return tak ? out + " " + T.tak : out;
+}
+
+/* ---------- translation: the model translates short lines, every line is checked ---------- */
+/* returns the clean line, or null if the line looks wrong (then the English line is kept) */
+function trFix(src, out, lang) {
+  out = (out || "").trim().replace(/[०-९]/g, (d) => "०१२३४५६७८९".indexOf(d));
+  if (!out || out.length > src.length * 4 + 30 || gibberish(out)) return null;
+  const nums = (s) => [...new Set(s.match(/\d+/g) || [])].sort().join(",");
+  if (nums(src) !== nums(out)) return null;
+  const L = out.match(/\p{L}/gu) || [];
+  const dev = L.filter((c) => /[\u0900-\u097F]/.test(c)).length / (L.length || 1);
+  if (lang === "Hindi") return dev >= 0.4 ? out : null;
+  const flat = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  return dev === 0 && flat(out) !== flat(src) ? out : null;
+}
+const TR = {
+  Hindi: {
+    intro: "Translate each numbered line from English to Hindi, written in Devanagari script.",
+    ex: [
+      ["pay the rent", "किराया देना"],
+      ["call the doctor", "डॉक्टर को फ़ोन करना"],
+      ["The chat is about a birthday party planned for Sunday.", "यह चैट रविवार को होने वाली बर्थडे पार्टी की योजना के बारे में है।"]
+    ]
+  },
+  Hinglish: {
+    intro: "Translate each numbered line from English to Hinglish: Hindi written in the Roman alphabet, the way people type on WhatsApp.",
+    ex: [
+      ["pay the rent", "Rent dena"],
+      ["call the doctor", "Doctor ko call karna"],
+      ["The chat is about a birthday party planned for Sunday.", "Yeh chat Sunday ko hone wali birthday party ki planning ke baare mein hai."]
+    ]
+  }
+};
+async function translateAll(srcs, lang, hooks, acc) {
+  const cfg = TR[lang], res = [];
+  for (let i = 0; i < srcs.length; i += 6) {
+    if (S.stopped) throw new Error("stopped");
+    const part = srcs.slice(i, i + 6);
+    hooks.onStatus?.(`Translating to ${lang}… ${Math.min(i + 6, srcs.length)} of ${srcs.length}`);
+    const exIn = cfg.ex.map((e, k) => `${k + 1}. ${e[0]}`).join("\n");
+    const exOut = cfg.ex.map((e, k) => `${k + 1}. ${e[1]}`).join("\n");
+    const inp = part.map((s, k) => `${k + 1}. ${s}`).join("\n");
+    const r = await S.engine.chat.completions.create({
+      messages: [
+        { role: "system", content: "You are a careful translator. You translate short chat lines and never add or remove facts." },
+        { role: "user", content: `${cfg.intro} Keep names, numbers and times exactly as written. Do not explain. Reply with the numbered lines only.\n\nExample input:\n${exIn}\nExample output:\n${exOut}\n\nInput:\n${inp}\nOutput:` }
+      ],
+      stream: false, temperature: 0, top_p: 0.9, max_tokens: Math.min(420, 45 * part.length + 40)
+    });
+    acc.tokens += r.usage?.completion_tokens || 0;
+    const d = r.usage?.extra?.decode_tokens_per_s; if (d) acc.speeds.push(d);
+    const map = {};
+    for (const l of (r.choices?.[0]?.message?.content || "").split("\n")) {
+      const m = /^\s*(\d+)[.)]\s*(.+)$/.exec(l);
+      if (m) map[+m[1]] = m[2].trim();
+    }
+    part.forEach((s, k) => res.push(trFix(s, map[k + 1], lang)));
+  }
+  return res;
+}
+/* translate each different line once. The result is a Map: English line -> translated line (or null) */
+async function trMap(srcs, lang, hooks, acc) {
+  const uniq = [...new Set(srcs.filter(Boolean))];
+  const out = uniq.length ? await translateAll(uniq, lang, hooks, acc) : [];
+  const m = new Map();
+  uniq.forEach((s, i) => m.set(s, out[i]));
+  m.miss = out.filter((x) => !x).length;
+  return m;
+}
+
+/* ---------- long chats (over 3,500 characters) ---------- */
 async function summarizeLong(text, lang, hooks = {}) {
   const t0 = performance.now();
-  let tokens = 0, source;
-  const sp = [];
-  const note = (r) => { const d = r.usage?.extra?.decode_tokens_per_s; if (d) sp.push(d); };
+  const acc = { tokens: 0, speeds: [] };
+  const note = (r) => {
+    acc.tokens += r.usage?.completion_tokens || r.chunks;
+    const d = r.usage?.extra?.decode_tokens_per_s; if (d) acc.speeds.push(d);
+  };
+  let source;
   if (text.length <= 5000) {
-    source = `Here is a group chat:\n\n${text}\n\n${format(lang)}`;
+    source = `Here is a group chat:\n\n${text}\n\n${format()}`;
   } else {
     const parts = splitChat(text), notes = [];
     for (let i = 0; i < parts.length; i++) {
@@ -335,33 +448,39 @@ async function summarizeLong(text, lang, hooks = {}) {
       hooks.onStatus?.(`Reading part ${i + 1} of ${parts.length}…`);
       const r = await ask(`Here is part ${i + 1} of ${parts.length} of a group chat:\n\n${parts[i]}\n\nWrite 3 to 6 short bullet notes: key points, decisions, tasks (with who owns them) and any dates or times. Use only what is written.`, { max: 220 });
       notes.push(r.text.trim());
-      tokens += r.usage?.completion_tokens || r.chunks;
       note(r);
     }
-    source = `Here are notes taken from a long group chat:\n\n${notes.join("\n\n")}\n\n${format(lang)}`;
+    source = `Here are notes taken from a long group chat:\n\n${notes.join("\n\n")}\n\n${format()}`;
   }
   const r = await ask(source, { max: 360, onToken: hooks.onToken });
-  tokens += r.usage?.completion_tokens || r.chunks;
   note(r);
-  const secs = (performance.now() - t0) / 1000;
+  const msgs = readMsgs(text);
   const p = parse(r.text);
-  if (!gistOk(p.gist, text, lang)) {
+  p.todo = p.todo.slice(0, 7); p.dates = p.dates.slice(0, 6);
+  let fb = false;
+  if (!gistOk(p.gist, text, "English")) {
     if (gibberish(r.text)) hooks.onWarn?.(BROKEN_MSG);
-    p.gist = fallbackGist(readMsgs(text), p.todo.length, p.dates.length, lang);
+    p.gist = fallbackGist(msgs, p.todo.length, p.dates.length, "English"); fb = true;
   }
-  const speed = sp.length ? sp.reduce((a, b) => a + b, 0) / sp.length : tokens / secs;
-  return { p, tokens, secs, speed };
+  if (lang !== "English") {
+    const m = await trMap([fb ? "" : p.gist, ...p.todo, ...p.dates], lang, hooks, acc);
+    if (m.miss) hooks.onWarn?.(MISS_MSG(m.miss));
+    const g = fb ? "" : m.get(p.gist);
+    p.gist = g || fallbackGist(msgs, p.todo.length, p.dates.length, lang);
+    p.todo = p.todo.map((s) => m.get(s) || s);
+    p.dates = p.dates.map((s) => m.get(s) || s);
+  }
+  const secs = (performance.now() - t0) / 1000;
+  const speed = acc.speeds.length ? acc.speeds.reduce((a, b) => a + b, 0) / acc.speeds.length : acc.tokens / secs;
+  return { p, tokens: acc.tokens, secs, speed };
 }
 
-/* ---------- summarize:  model writes the gist and tasks, rules pull the dates, all checked against the chat ---------- */
+/* ---------- summarize: the model finds the gist and tasks in English, rules find the dates, then everything is put into the chosen language ---------- */
 async function summarize(text, lang, hooks = {}) {
   if (text.length > 3500) return summarizeLong(text, lang, hooks);
   const t0 = performance.now();
-  const say = lang === "Hinglish" ? "Write in simple Hinglish (Hindi in English letters)."
-    : lang === "Hindi" ? "Write in Hindi." : "Write in English.";
-  const sys = "You read short chats and answer very briefly. Use only facts written in the chat. Never invent names, days or times. Never copy the chat. " + say;
-  let tokens = 0;
-  const speeds = [];
+  const sys = "You read short chats and answer very briefly. Use only facts written in the chat. Never invent names, days or times. Never copy the chat. Write in English.";
+  const acc = { tokens: 0, speeds: [] };
   const q = async (instruction, max) => {
     if (S.stopped) throw new Error("stopped");
     const r = await S.engine.chat.completions.create({
@@ -372,8 +491,8 @@ async function summarize(text, lang, hooks = {}) {
       stream: false, temperature: 0.1, top_p: 0.9, max_tokens: max,
       frequency_penalty: 0.6, presence_penalty: 0.3
     });
-    tokens += r.usage?.completion_tokens || 0;
-    const d = r.usage?.extra?.decode_tokens_per_s; if (d) speeds.push(d);
+    acc.tokens += r.usage?.completion_tokens || 0;
+    const d = r.usage?.extra?.decode_tokens_per_s; if (d) acc.speeds.push(d);
     return r.choices?.[0]?.message?.content || "";
   };
   const lines = (s) => {
@@ -390,14 +509,25 @@ async function summarize(text, lang, hooks = {}) {
   const msgs = readMsgs(text);
   const speakers = new Set(msgs.map((m) => m.who.toLowerCase()));
 
-  /* 2) model: gist and tasks */
+  /* 2) model: gist and tasks, always in English */
   hooks.onStatus?.("Finding the gist…");
-  const gistRaw = await q("Write one full sentence of 10 to 20 words saying what this chat is about and what is planned. " + say + " Reply with the sentence only.", 80);
+  const gistRaw = await q("Write one full sentence of 10 to 20 words saying what this chat is about and what is planned. Name the event and the day if the chat says them. Do not use vague words like details or arrangements. Reply with the sentence only.", 80);
   hooks.onStatus?.("Finding the tasks…");
-  const todoRaw = await q("List what each person said they will do. One line per task, written as Name: task. Use only names from the chat. At most 6 lines. Reply with the list only.", 140);
+  const todoRaw = await q("List what each person said they will do. One line per task, written as Name: task. Use only names from the chat. At most 6 lines. Reply with the list only.", 120);
   hooks.onStatus?.("Checking tasks and dates…");
 
-  /* 3) tasks: rule-based first (I will ...), then model tasks that name a real speaker and are not repeats */
+  /* 3) rules: words that name a day or a time, and helpers that clean a message */
+  const dayRe = /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|tonight|noon|kal|parso|aaj|subah|shaam|raat|dopahar|baje|somvar|mangalvar|budhvar|guruvar|shukravar|shanivar|ravivar)\b|\b\d{1,2}(:\d{2})?\s?(am|pm|baje)\b|\b\d{1,2}:\d{2}\b|\b\d{1,2}(st|nd|rd|th)\b|कल|परसों|आज|सुबह|शाम|रात|बजे|सोमवार|मंगलवार|बुधवार|गुरुवार|शुक्रवार|शनिवार|रविवार/i;
+  const whenRe = /(?:\b(?:on|at|by|before|till|until)\s+)?(?:\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|tonight)\b(?:\s+(?:morning|afternoon|evening|night))?|\b\d{1,2}(?::\d{2})?\s?(?:am|pm)\b|\b\d{1,2}:\d{2}\b)/gi;
+  const clean = (s) => s.replace(/^(?:(?:yes|yeah|yep|yup|ok(?:ay)?|sure|done|great|fine|cool|alright|haan|ha|theek hai|pakka)\b[,.!\s]*)+/i, "").trim();
+  /* the action part of a message: filler words, time words and a starting "I will" removed */
+  const core = (msg) => clean(msg.replace(whenRe, ""))
+    .replace(/\s+/g, " ").replace(/\s+([.,!?])/g, "$1")
+    .replace(/^(i will|i'll|i am going to|i'm going to)\s+/i, "")
+    .replace(/[,.! ]+$/, "").trim();
+  const whenOf = (msg) => { const f = msg.match(whenRe); return f ? f.map((x) => x.trim()) : []; };
+
+  /* 4) tasks: "I will ...", then requests ("please ..."), then model tasks that name a real speaker and are not repeats */
   const willRe = /\b(i will|i'll|i am going to|i'm going to)\b|\b\w+(unga|ungi)\b/i;
   const stop = new Set(["the", "and", "for", "you", "with", "from", "that", "this", "will", "are", "was", "has", "have", "sunday", "saturday", "morning", "evening", "please", "pick"]);
   const words = (s) => new Set(s.toLowerCase().match(/[a-z]{4,}/g)?.filter((w) => !stop.has(w)) || []);
@@ -407,55 +537,83 @@ async function summarize(text, lang, hooks = {}) {
     let n = 0; A.forEach((w) => { if (B.has(w)) n++; });
     return n >= 1 && n / Math.min(A.size, B.size) >= 0.3;
   };
-  const todo = [];
+  const todo = []; /* { who, what, when[], ask } */
+  const taken = (what) => todo.some((x) => similar(x.what, what));
   for (const m of msgs) {
-    if (!willRe.test(m.msg)) continue;
-    let t = m.msg.replace(/^(ok(ay)?|sure|done|great|fine|haan|theek hai|pakka)[,.! ]+/i, "")
-      .replace(/\b(i will|i'll|i am going to|i'm going to)\s+/i, "");
-    todo.push(m.who + ": " + t);
+    const c = clean(m.msg);
+    if (!willRe.test(c)) continue;
+    if (/\b(i will|i'll)\s+be\b/i.test(c)) continue; /* "I will be late" is not a task */
+    const what = core(m.msg);
+    if (what) todo.push({ who: m.who, what, when: whenOf(m.msg), ask: false });
+  }
+  for (const m of msgs) {
+    const r = /^(?:([A-Za-z]+),\s*)?please\s+(.+)$/i.exec(core(m.msg));
+    if (!r) continue;
+    const what = r[2].split(/[.!?]/)[0].trim();
+    if (!what || taken(what)) continue;
+    const owner = r[1] && speakers.has(r[1].toLowerCase()) ? r[1] : null;
+    todo.push({ who: owner || m.who, what, when: whenOf(m.msg), ask: !owner });
   }
   for (const l of lines(todoRaw)) {
     const i = l.indexOf(":");
     if (i < 1) continue;
-    if (speakers.size && !speakers.has(l.slice(0, i).trim().toLowerCase())) continue;
-    if (todo.some((x) => similar(x.slice(x.indexOf(":") + 1), l.slice(i + 1)))) continue;
-    todo.push(l);
+    const who = l.slice(0, i).trim(), what = l.slice(i + 1).trim().replace(/[,.! ]+$/, "");
+    if (speakers.size && !speakers.has(who.toLowerCase())) continue;
+    if (!what || taken(what)) continue;
+    todo.push({ who, what, when: [], ask: false });
   }
 
-  /* 4) dates: pull the chat lines that name a day or a time (nothing is invented) */
-  /* FIX: "2:30" without am/pm is now found; bare "night", "morning", "evening", "afternoon" removed (they matched "9,000 a night" and "good morning") */
-  const dayRe = /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|tonight|noon|kal|parso|aaj|subah|shaam|raat|dopahar|baje|somvar|mangalvar|budhvar|guruvar|shukravar|shanivar|ravivar)\b|\b\d{1,2}(:\d{2})?\s?(am|pm|baje)\b|\b\d{1,2}:\d{2}\b|\b\d{1,2}(st|nd|rd|th)\b|कल|परसों|आज|सुबह|शाम|रात|बजे|सोमवार|मंगलवार|बुधवार|गुरुवार|शुक्रवार|शनिवार|रविवार/i;
-  const whenRe = /(?:\b(?:on|at|by|before|till|until)\s+)?(?:\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|tonight)\b(?:\s+(?:morning|afternoon|evening|night))?|\b\d{1,2}(?::\d{2})?\s?(?:am|pm)\b|\b\d{1,2}:\d{2}\b)/gi;
+  /* 5) dates: pull the chat lines that name a day or a time (nothing is invented) */
   const pool = msgs.length ? msgs : text.split(/[\n.!?]+/).map((s) => ({ who: "", msg: s.replace(STAMP, "").trim() })).filter((m) => m.msg);
-  const dates = [], seenD = new Set();
+  const dates = [], seenD = new Set(); /* { who, what, when[] } */
   for (const m of pool) {
     if (!dayRe.test(m.msg)) continue;
-    const found = m.msg.match(whenRe);
-    let line;
-    if (found) {
-      const when = found.map((x) => x.trim().replace(/^(on|at)\s+/i, "")).join(", ");
-      const what = m.msg.replace(whenRe, "").replace(/\b(i will|i'll)\s+/i, "").replace(/^(ok(ay)?|sure)[,.! ]+/i, "")
-        .replace(/\s+/g, " ").replace(/\s+([.,!?])/g, "$1").replace(/[,.! ]+$/, "").trim();
-      line = when + " — " + (m.who ? m.who + ": " : "") + what;
-    } else line = (m.who ? m.who + ": " : "") + m.msg;
-    if (line.length > 110) line = line.slice(0, 107) + "…";
-    const k = line.toLowerCase();
-    if (seenD.has(k)) continue;
-    seenD.add(k);
-    dates.push(line);
+    const when = whenOf(m.msg);
+    let what = (when.length ? core(m.msg) : "") || clean(m.msg).replace(/[,.! ]+$/, "");
+    if (what.length > 90) what = what.slice(0, 87) + "…";
+    const key = (when.join() + what).toLowerCase();
+    if (seenD.has(key)) continue;
+    seenD.add(key);
+    dates.push({ who: m.who, what, when });
   }
 
-  const secs = (performance.now() - t0) / 1000;
-  const T = todo.slice(0, 7), D = dates.slice(0, 6);
-  /* FIX: check the gist. If it is broken, in the wrong language, or has invented numbers, use a safe gist */
+  const T = todo.slice(0, lang === "English" ? 7 : 6), D = dates.slice(0, lang === "English" ? 6 : 5);
+
+  /* 6) English gist: check it. If it is broken or has invented numbers, use a safe gist */
   let gist = lines(gistRaw).slice(0, 2).join(" ");
-  if (!gistOk(gist, text, lang)) {
+  let fb = false;
+  if (!gistOk(gist, text, "English")) {
     if (gibberish(gistRaw)) hooks.onWarn?.(BROKEN_MSG);
-    gist = fallbackGist(msgs, T.length, D.length, lang);
+    gist = fallbackGist(msgs, T.length, D.length, "English"); fb = true;
   }
-  /* FIX: real decode speed (average), not total time */
-  const speed = speeds.length ? speeds.reduce((a, b) => a + b, 0) / speeds.length : tokens / secs;
-  return { p: { gist, todo: T, dates: D }, tokens, secs, speed };
+
+  /* 7) translate the gist and the action lines (each different line once) */
+  let tr = (s) => s;
+  if (lang !== "English") {
+    const m = await trMap([fb ? "" : gist, ...T.map((x) => x.what), ...D.map((x) => x.what)], lang, hooks, acc);
+    if (m.miss) hooks.onWarn?.(MISS_MSG(m.miss));
+    tr = (s) => m.get(s) || s;
+    const g = fb ? "" : m.get(gist);
+    gist = g || fallbackGist(msgs, T.length, D.length, lang);
+  }
+
+  /* 8) build the final lines. Days and times come from the word list. */
+  const LB = LBL[lang];
+  const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+  const whenStr = (arr) => arr.map((x) => whenLocal(x, lang)).join(", ");
+  const todoOut = T.map((x) => {
+    const w = whenStr(x.when);
+    return `${x.who}${x.ask ? " " + LB.asks : ""}: ${tr(x.what)}${w ? " (" + w + ")" : ""}`;
+  });
+  const datesOut = D.map((x) => {
+    const w = whenStr(x.when);
+    const body = `${x.who ? x.who + ": " : ""}${tr(x.what)}`;
+    return w ? `${cap(w)} — ${body}` : body;
+  });
+
+  const secs = (performance.now() - t0) / 1000;
+  const speed = acc.speeds.length ? acc.speeds.reduce((a, b) => a + b, 0) / acc.speeds.length : acc.tokens / secs;
+  return { p: { gist, todo: todoOut, dates: datesOut }, tokens: acc.tokens, secs, speed };
 }
 
 /* ---------- render result ---------- */
@@ -477,12 +635,19 @@ function fill(ul, items, emptyText, checks) {
     ul.appendChild(li);
   });
 }
-function showResult(p, stats) {
+function showResult(p, stats, lang = "English") {
+  const LB = LBL[lang] || LBL.English;
+  S.shownLang = LBL[lang] ? lang : "English";
   $("#result").classList.remove("hidden");
   $("#skel").classList.add("hidden"); $("#live").classList.add("hidden");
   $("#gist").textContent = p.gist;
-  fill($("#todo"), p.todo, "Nothing you need to do.", true);
-  fill($("#dates"), p.dates, "No dates or plans mentioned.", false);
+  const heads = $$("#out .block-t");
+  if (heads[0]) heads[0].textContent = LB.todo;
+  if (heads[1]) heads[1].textContent = LB.dates;
+  fill($("#todo"), p.todo, LB.noTodo, true);
+  fill($("#dates"), p.dates, LB.noDates, false);
+  $("#copy").textContent = LB.copy;
+  $("#share").textContent = LB.share;
   $("#out").classList.remove("hidden");
   if (stats) {
     $("#sModel").textContent = S.modelLabel;
@@ -491,11 +656,12 @@ function showResult(p, stats) {
     $("#sTime").textContent = stats.secs.toFixed(1) + " s";
     $("#stats").classList.remove("hidden");
   } else { $("#stats").classList.add("hidden"); }
-  }
+}
 
 $("#go").addEventListener("click", async () => {
   const text = chat.value.trim();
   if (!S.engine || S.busy || text.length < 20) return;
+  const lang = S.lang;
   S.busy = true; S.stopped = false; hideNotice(); hideReadNotice(); refresh(); haptic(12);
   const live = $("#live"), skel = $("#skel");
   $("#result").classList.remove("hidden");
@@ -506,10 +672,10 @@ $("#go").addEventListener("click", async () => {
   const show = (m) => { skel.classList.add("hidden"); live.classList.remove("hidden"); live.textContent = m; };
   let warn = "";
   try {
-    const r = await summarize(text, S.lang, { onStatus: show, onToken: show, onWarn: (m) => { warn = m; } });
+    const r = await summarize(text, lang, { onStatus: show, onToken: show, onWarn: (m) => { warn = m; } });
     if (S.stopped) { $("#result").classList.add("hidden"); }
     else {
-      showResult(r.p, r); addSaved(r.p); haptic([10, 40, 10]);
+      showResult(r.p, r, lang); addSaved(r.p, lang); haptic([10, 40, 10]);
       if (warn) toast(warn, 4500);
     }
   } catch (e) {
@@ -526,8 +692,9 @@ $("#stop").addEventListener("click", () => { S.stopped = true; try { S.engine.in
 
 /* ---------- copy / share ---------- */
 function asText() {
+  const LB = LBL[S.shownLang] || LBL.English;
   const li = (id) => $$(id + " li span").map((s) => "- " + s.textContent).join("\n");
-  return `${$("#gist").textContent}\n\nTo do\n${li("#todo") || "- None"}\n\nDates and plans\n${li("#dates") || "- None"}`;
+  return `${$("#gist").textContent}\n\n${LB.todo}\n${li("#todo") || "- " + LB.none}\n\n${LB.dates}\n${li("#dates") || "- " + LB.none}`;
 }
 $("#copy").addEventListener("click", async () => {
   try { await navigator.clipboard.writeText(asText()); toast("Copied"); haptic(8); } catch { toast("Copy failed"); }
@@ -538,10 +705,10 @@ if (navigator.share) {
 }
 
 /* ---------- saved ---------- */
-function titleOf(g) { return g.split(/\s+/).slice(0, 7).join(" ").replace(/[.,;:!?]+$/, ""); }
-function addSaved(p) {
+function titleOf(g) { return g.split(/\s+/).slice(0, 7).join(" ").replace(/[.,;:!?।]+$/, ""); }
+function addSaved(p, lang = S.lang) {
   const list = store.get(KEY_SAVED, []);
-  list.unshift({ id: Date.now(), ts: Date.now(), title: titleOf(p.gist), gist: p.gist, todo: p.todo, dates: p.dates, model: S.modelLabel, lang: S.lang });
+  list.unshift({ id: Date.now(), ts: Date.now(), title: titleOf(p.gist), gist: p.gist, todo: p.todo, dates: p.dates, model: S.modelLabel, lang });
   store.set(KEY_SAVED, list.slice(0, 100));
   renderSaved();
 }
@@ -571,7 +738,7 @@ function renderSaved() {
 function openSaved(el) {
   const x = store.get(KEY_SAVED, []).find((v) => v.id === +el.dataset.id);
   if (!x) return;
-  showResult({ gist: x.gist, todo: x.todo, dates: x.dates }, null);
+  showResult({ gist: x.gist, todo: x.todo, dates: x.dates }, null, x.lang || "English");
   goTab(0);
   $("#result").scrollIntoView({ behavior: "smooth", block: "start" });
 }
