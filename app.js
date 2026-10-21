@@ -175,7 +175,7 @@ $("#load").addEventListener("click", async () => {
     if (S.engine) { try { await S.engine.unload(); } catch {} S.engine = null; }
     S.engine = await S.webllm.CreateMLCEngine(id, {
       initProgressCallback: (r) => { setProgress(r.progress || 0); setStatus(r.text || "Loading…"); }
-    });
+    }, /gemma/i.test(id) ? { sliding_window_size: -1 } : undefined);
     S.modelId = id; S.modelLabel = prettyName(id);
     S.loadSecs = (performance.now() - t0) / 1000;
     store.set(KEY_MODEL, id);
@@ -326,20 +326,20 @@ async function summarize(text, lang, hooks = {}) {
 
   /* 2) model: gist and tasks */
   hooks.onStatus?.("Finding the gist…");
-  const gistRaw = await q("In one short sentence, say what this chat is about. Reply with the sentence only.", 60);
+  const gistRaw = await q("Write one full sentence of 10 to 20 words saying what this chat is about and what is planned. " + say + " Reply with the sentence only.", 80);
   hooks.onStatus?.("Finding the tasks…");
   const todoRaw = await q("List what each person said they will do. One line per task, written as Name: task. Use only names from the chat. At most 6 lines. Reply with the list only.", 140);
   hooks.onStatus?.("Checking tasks and dates…");
 
   /* 3) tasks: rule-based first (I will ...), then model tasks that name a real speaker and are not repeats */
   const willRe = /\b(i will|i'll|i am going to|i'm going to)\b|\b\w+(unga|ungi)\b/i;
-  const stop = new Set(["the", "and", "for", "you", "with", "from", "that", "this", "will", "are", "was", "has", "have"]);
-  const words = (s) => new Set(s.toLowerCase().match(/[a-z]{3,}/g)?.filter((w) => !stop.has(w)) || []);
+  const stop = new Set(["the", "and", "for", "you", "with", "from", "that", "this", "will", "are", "was", "has", "have", "sunday", "saturday", "morning", "evening", "please", "pick"]);
+  const words = (s) => new Set(s.toLowerCase().match(/[a-z]{4,}/g)?.filter((w) => !stop.has(w)) || []);
   const similar = (a, b) => {
     const A = words(a), B = words(b);
     if (!A.size || !B.size) return false;
     let n = 0; A.forEach((w) => { if (B.has(w)) n++; });
-    return n / Math.min(A.size, B.size) >= 0.5;
+    return n >= 1 && n / Math.min(A.size, B.size) >= 0.3;
   };
   const todo = [];
   for (const m of msgs) {
@@ -358,14 +358,24 @@ async function summarize(text, lang, hooks = {}) {
 
   /* 4) dates: pull the chat lines that name a day or a time (nothing is invented) */
   const dayRe = /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|tonight|morning|evening|afternoon|night|noon|kal|parso|aaj|subah|shaam|raat|dopahar|baje|somvar|mangalvar|budhvar|guruvar|shukravar|shanivar|ravivar)\b|\b\d{1,2}(:\d{2})?\s?(am|pm)\b|\b\d{1,2}(st|nd|rd|th)\b|कल|परसों|आज|सुबह|शाम|रात|बजे|सोमवार|मंगलवार|बुधवार|गुरुवार|शुक्रवार|शनिवार|रविवार/i;
-  const pool = msgs.length ? msgs.map((m) => m.who + ": " + m.msg) : text.split(/[\n.!?]+/).map((s) => s.trim());
+  const whenRe = /(?:\b(?:on|at|by|before|till|until)\s+)?(?:\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|tonight)\b(?:\s+(?:morning|afternoon|evening|night))?|\b\d{1,2}(?::\d{2})?\s?(?:am|pm)\b)/gi;
+  const pool = msgs.length ? msgs : text.split(/[\n.!?]+/).map((s) => ({ who: "", msg: s.trim() })).filter((m) => m.msg);
   const dates = [], seenD = new Set();
-  for (const l of pool) {
-    if (!dayRe.test(l)) continue;
-    const k = l.toLowerCase();
+  for (const m of pool) {
+    if (!dayRe.test(m.msg)) continue;
+    const found = m.msg.match(whenRe);
+    let line;
+    if (found) {
+      const when = found.map((x) => x.trim().replace(/^(on|at)\s+/i, "")).join(", ");
+      const what = m.msg.replace(whenRe, "").replace(/\b(i will|i'll)\s+/i, "").replace(/^(ok(ay)?|sure)[,.! ]+/i, "")
+        .replace(/\s+/g, " ").replace(/\s+([.,!?])/g, "$1").replace(/[,.! ]+$/, "").trim();
+      line = when + " — " + (m.who ? m.who + ": " : "") + what;
+    } else line = (m.who ? m.who + ": " : "") + m.msg;
+    if (line.length > 110) line = line.slice(0, 107) + "…";
+    const k = line.toLowerCase();
     if (seenD.has(k)) continue;
     seenD.add(k);
-    dates.push(l.length > 110 ? l.slice(0, 107) + "…" : l);
+    dates.push(line);
   }
 
   const secs = (performance.now() - t0) / 1000;
