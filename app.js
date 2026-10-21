@@ -170,6 +170,7 @@ function refresh() {
     h.classList.toggle("hidden", !weak);
   }
 }
+
 function paintCount() {
   $("#count").textContent = chat.value.length.toLocaleString() + " characters";
   refresh();
@@ -362,17 +363,32 @@ function normalize(t) {
 
 const STAMP = /^\s*(?:\[[^\]]*\]|\(?\d{1,2}[\/.]\d{1,2}[\/.]\d{2,4},?\s*\d{1,2}:\d{2}(?::\d{2})?(?:\s?[ap]m)?\)?\s*-)\s*/i;
 const SKIP_MSG = /^<?(?:media|image|video|audio|sticker|gif|document) omitted>?$|^this message was deleted$|^you deleted this message$|^<attached:/i;
+const NAME_RE = /^((?:\+?\d[\d\s-]{7,}\d)|[^:\n\d]{1,30}):\s*(.+)$/;
 function readMsgs(text) {
   const msgs = [];
   const lines = text.split("\n");
   const stamped = lines.some((l) => STAMP.test(l));
+  const known = new Set();
+  for (const raw of lines) {
+    if (stamped && !STAMP.test(raw)) continue;
+    const m = raw.replace(STAMP, "").match(NAME_RE);
+    if (m) known.add(m[1].trim());
+  }
+  const knownList = [...known].sort((a, b) => b.length - a.length);
   for (const raw of lines) {
     if (stamped && !STAMP.test(raw)) {
       if (msgs.length && raw.trim()) msgs[msgs.length - 1].msg += " " + raw.trim();
       continue;
     }
-    const m = raw.replace(STAMP, "").match(/^([^:\n]{1,30}):\s*(.+)$/);
-    if (m && !SKIP_MSG.test(m[2].trim())) msgs.push({ who: m[1].trim(), msg: m[2].trim() });
+    const body = raw.replace(STAMP, "").trim();
+    let who = null, msg = null;
+    const m = body.match(NAME_RE);
+    if (m) { who = m[1].trim(); msg = m[2].trim(); }
+    else if (stamped) {
+      const k = knownList.find((n) => body.toLowerCase().startsWith(n.toLowerCase() + " "));
+      if (k) { who = k; msg = body.slice(k.length).trim(); }
+    }
+    if (who && msg && !SKIP_MSG.test(msg)) msgs.push({ who, msg });
   }
   return msgs;
 }
@@ -411,7 +427,7 @@ function gistOk(g, text) {
   if (words < 4 || words > 50) return false;
   if (/\[\d{1,2}:\d{2}\]|^\w+:\s/.test(g)) return false;
   const seen = new Set(text.match(/\d+/g) || []);
-  if ((g.match(/\d+/g) || []).some((n) => !seen.has(n))) return false;
+  if ((g.match(/\d+/g) || []).some((n) => !seen.has(n) && !/^0+$/.test(n))) return false;
   if (inventedNames(g, text)) return false;
   return true;
 }
@@ -442,9 +458,9 @@ function joinNames(a, lang) {
 function fallbackGist(msgs, nTodo, nDates, lang, head = "") {
   const who = joinNames([...new Set(msgs.map((m) => m.who))].slice(0, 4), lang);
   const h = head ? head.replace(/[.!?।\s]+$/, "") + (lang === "Hindi" ? "। " : ". ") : "";
-  if (lang === "Hindi") return (who ? who + " की चैट। " : "चैट। ") + h + `${nTodo} काम और ${nDates} योजनाओं या समय का ज़िक्र हुआ।`;
+  if (lang === "Hindi") return (who ? who + " की चैट। " : "चैट। ") + h + `${nTodo} काम और ${nDates} ${nDates === 1 ? "योजना या समय" : "योजनाओं या समय"} का ज़िक्र हुआ।`;
   if (lang === "Hinglish") return (who ? who + " ki chat. " : "Chat. ") + h + `${nTodo} kaam aur ${nDates} plan ya time ka zikr hua.`;
-  return (who ? "Chat between " + who + ". " : "Chat. ") + h + `${nTodo} tasks and ${nDates} plans or times were mentioned.`;
+  return (who ? "Chat between " + who + ". " : "Chat. ") + h + `${nTodo} ${nTodo === 1 ? "task" : "tasks"} and ${nDates} ${nDates === 1 ? "plan or time" : "plans or times"} mentioned.`;
 }
 const BROKEN_MSG = "Model wrote broken text, so a simple summary was used. Try Llama 3.2 1B in Lab.";
 const MISS_MSG = (n) => `${n} line${n > 1 ? "s" : ""} stayed in English. A bigger model (Llama 3.2 3B) translates better.`;
@@ -561,6 +577,11 @@ function ruleTrRaw(src, lang, names) {
     const unit = hi ? (h ? "घंटे" : "मिनट") : (h ? "ghante" : "minute");
     return late[2] + " " + unit + " " + (hi ? "देर " + (maybe ? "हो सकती है" : "होगी") : "der " + (maybe ? "ho sakti hai" : "hogi"));
   }
+  const lateOnly = /^(?:i\s+)?(might be|may be|will be|'ll be|be)\s+late$/i.exec(s);
+  if (lateOnly) {
+    const maybe = /might|may/i.test(lateOnly[1]);
+    return hi ? "देर " + (maybe ? "हो सकती है" : "होगी") : "der " + (maybe ? "ho sakti hai" : "hogi");
+  }
   s = s.replace(/^(?:i will|i'll|will|to|please)\s+/i, "");
   const ev = /^(?:everyone|everybody|all|guys)\s+(.+)$/i.exec(s);
   if (ev) { const r = ruleTrRaw(ev[1], lang, names); return r ? (hi ? "सब लोग " : "sab log ") + r : null; }
@@ -670,7 +691,8 @@ function extractRules(text, msgs, modelLines = []) {
   const pool = msgs.length ? items : text.split(/[\n.!?]+/).map((s) => ({ who: "", msg: s.replace(STAMP, "").trim() })).filter((m) => m.msg);
   const dates = [], seenD = new Set();
   for (const m of pool) {
-    if (/\?\s*$/.test(m.msg.trim())) continue;
+    const isQ = /\?\s*$/.test(m.msg.trim());
+    if (isQ && (/\b(are|is|do|does|did|can|could|shall|should|who|what|when|where|why|how|kya|kaun)\b/i.test(m.msg) || !dayRe.test(m.msg))) continue;
     const lt = /\b(might be|may be|will be|'ll be)\s+(\d+)\s*(minutes?|mins?|hours?|hrs?)\s+late\b/i.exec(m.msg);
     if (lt) {
       const n = +lt[2], unit = /^h/i.test(lt[3]) ? (n === 1 ? "hour" : "hours") : (n === 1 ? "minute" : "minutes");
@@ -679,9 +701,16 @@ function extractRules(text, msgs, modelLines = []) {
       if (!seenD.has(key)) { seenD.add(key); dates.push({ who: m.who, what, when: [] }); }
       continue;
     }
+    const ll = /\b(might be|may be|will be|'ll be)\s+late\b/i.exec(m.msg);
+    if (ll) {
+      const what = (/might|may/i.test(ll[1]) ? "might be" : "will be") + " late";
+      const key = (m.who + what).toLowerCase();
+      if (!seenD.has(key)) { seenD.add(key); dates.push({ who: m.who, what, when: [] }); }
+    }
     if (!dayRe.test(m.msg)) continue;
     const when = whenOf(m.msg);
     let what = (when.length ? core(m.msg) : "") || clean(m.msg).replace(/[,.!? ]+$/, "");
+    what = what.replace(/^Will\b/, "will");
     if (taken(what)) continue;
     if (what.length > 90) what = what.slice(0, 87) + "…";
     const key = (when.join() + what).toLowerCase();
@@ -847,7 +876,7 @@ async function summarize(text, lang, hooks = {}) {
   const q = (instruction, max) => gen([
     { role: "system", content: sys },
     { role: "user", content: `${label}\n${ctx}\n\n${instruction}` }
-  ], max, acc, { penalty: true });
+  ], max, acc, { temp: 0 });
 
   hooks.onStatus?.("Finding the gist…");
   const gistRaw = await q("Write one full sentence of 10 to 20 words saying what this chat is about and what is planned. Name the event and the day if the chat says them. Do not use vague words like details or arrangements. Reply with the sentence only.", 80);
@@ -862,6 +891,8 @@ async function summarize(text, lang, hooks = {}) {
   let gist = sentenceCase(firstSentences(lines(gistRaw).join(" "), 2), text, names);
   let fb = false;
   if (!gistOk(gist, text)) {
+    console.warn("Gist rejected. Raw:", JSON.stringify(gistRaw));
+    // toast("RAW: " + gistRaw.slice(0, 120), 8000); // remove the // at the start to see this on your phone
     if (gibberish(gistRaw)) hooks.onWarn?.(BROKEN_MSG);
     gist = fallbackGist(msgs, T.length, D.length, "English"); fb = true;
   }
@@ -895,7 +926,7 @@ async function summarize(text, lang, hooks = {}) {
 
   if (fb) {
     const hd = D.find((x) => x.when.length);
-    const head = hd ? capFirst(whenStr(hd.when)) + ": " + tr(hd.what) : "";
+    const head = hd ? capFirst(tr(hd.what)) + " (" + whenStr(hd.when) + ")" : "";
     gist = fallbackGist(msgs, T.length, D.length, lang, head);
   }
   const secs = (performance.now() - t0) / 1000;
@@ -1005,6 +1036,7 @@ function addSaved(p, lang = S.lang) {
   store.set(KEY_SAVED, list.slice(0, 100));
   renderSaved();
 }
+
 function renderSaved() {
   const q = $("#q").value.trim().toLowerCase();
   const all = store.get(KEY_SAVED, []);
