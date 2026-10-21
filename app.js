@@ -378,11 +378,12 @@ function joinNames(a, lang) {
   if (a.length < 2) return a[0] || "";
   return a.slice(0, -1).join(", ") + " " + and + " " + a[a.length - 1];
 }
-function fallbackGist(msgs, nTodo, nDates, lang) {
+function fallbackGist(msgs, nTodo, nDates, lang, head = "") {
   const who = joinNames([...new Set(msgs.map((m) => m.who))].slice(0, 4), lang);
-  if (lang === "Hindi") return (who ? who + " की चैट। " : "चैट। ") + `${nTodo} काम और ${nDates} योजनाओं या समय का ज़िक्र हुआ।`;
-  if (lang === "Hinglish") return (who ? who + " ki chat. " : "Chat. ") + `${nTodo} kaam aur ${nDates} plan ya time ka zikr hua.`;
-  return (who ? "Chat between " + who + ". " : "Chat. ") + `${nTodo} tasks and ${nDates} plans or times were mentioned.`;
+  const h = head ? head.replace(/[.!?।\s]+$/, "") + (lang === "Hindi" ? "। " : ". ") : "";
+  if (lang === "Hindi") return (who ? who + " की चैट। " : "चैट। ") + h + `${nTodo} काम और ${nDates} योजनाओं या समय का ज़िक्र हुआ।`;
+  if (lang === "Hinglish") return (who ? who + " ki chat. " : "Chat. ") + h + `${nTodo} kaam aur ${nDates} plan ya time ka zikr hua.`;
+  return (who ? "Chat between " + who + ". " : "Chat. ") + h + `${nTodo} tasks and ${nDates} plans or times were mentioned.`;
 }
 const BROKEN_MSG = "Model wrote broken text, so a simple summary was used. Try Llama 3.2 1B in Lab.";
 const MISS_MSG = (n) => `${n} line${n > 1 ? "s" : ""} stayed in English. A bigger model (Llama 3.2 3B) translates better.`;
@@ -627,6 +628,12 @@ const TR = {
   }
 };
 const HINGLISH_WORDS = /\b(hai|hain|ka|ki|ke|ko|se|mein|me|aur|karna|kar|yeh|ye|woh|ne|par|pe|tak|liye|wala|wali|hoga|hogi|raha|rahe|rahi|nahi|bhi|ho|hua|hone|\w+(?:ega|egi|enge|unga|ungi))\b/i;
+const HINGLISH_OK = new Set(("hai hain tha thi the ho hoga hogi honge hua hui hue ka ki ke ko se mein me par pe tak aur ya bhi hi na nahi koi kuch sab log " +
+  "yeh ye woh wo is us isme usme ek do teen char paanch kaam plan chat baat baare liye wala wali wale karna karne kar karo karta karti kiya kiye " +
+  "lana lena dena bhejna bhej book booking ticket tickets movie night event trip party meeting dinner lunch snacks time date raat subah shaam " +
+  "dopahar aaj kal parso baje agle pichle hone jana aana pahunchna naya mujhe hamein tumhe unhe unka unki unke apna apni apne jab tab agar " +
+  "lekin phir bahut thoda zyada kam sirf pehle baad saath bina rupaye paise har paas door ghar office kaun kya kab kahan kaise kyun " +
+  "chahiye sakta sakti sakte padega padegi hoti hota hote raha rahe rahi wapas jaldi der").split(" "));
 function keeps(src, out, lang, names) {
   const lo = out.toLowerCase();
   const ws = src.match(/[A-Za-z][A-Za-z'-]*/g) || [];
@@ -655,6 +662,10 @@ function trFix(src, out, lang, names) {
   const dev = devRatio(out);
   if (lang === "Hindi") return dev >= 0.4 ? out : null;
   if (dev !== 0) return null;
+  const srcWords = new Set(src.toLowerCase().match(/[a-z]+/g) || []);
+  const bad = (out.toLowerCase().match(/[a-z]+/g) || []).filter((w) =>
+    !srcWords.has(w) && !HINGLISH_OK.has(w) && !names.has(w) && !DAYS.includes(w) && !/(ega|egi|enge|unga|ungi)$/.test(w));
+  if (bad.length) return null;
   const flat = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, "");
   if (flat(out) === flat(src)) return null;
   if (out.split(/\s+/).length >= 4 && !HINGLISH_WORDS.test(out)) return null;
@@ -753,8 +764,12 @@ async function summarize(text, lang, hooks = {}) {
     let miss = m.miss;
     tr = (s) => m.get(s) || s;
     let g = null;
-    if (!fb) { g = (await translateAll([gist], lang, hooks, acc, names))[0]; if (!g) miss++; }
-    gist = g || fallbackGist(msgs, T.length, D.length, lang);
+    if (!fb) {
+      const sents = gist.split(/(?<=[.!?])\s+/).filter(Boolean);
+      const outs = (await translateAll(sents, lang, hooks, acc, names)).filter(Boolean);
+      if (outs.length) g = outs.join(" ");
+    }
+    if (g) gist = g; else { gist = ""; fb = true; }
     if (miss) hooks.onWarn?.(MISS_MSG(miss));
   }
 
@@ -770,6 +785,11 @@ async function summarize(text, lang, hooks = {}) {
     return w ? `${capFirst(w)} — ${body}` : body;
   });
 
+  if (fb) {
+    const hd = D.find((x) => x.when.length);
+    const head = hd ? capFirst(whenStr(hd.when)) + ": " + tr(hd.what) : "";
+    gist = fallbackGist(msgs, T.length, D.length, lang, head);
+  }
   const secs = (performance.now() - t0) / 1000;
   const speed = acc.speeds.length ? acc.speeds.reduce((a, b) => a + b, 0) / acc.speeds.length : acc.tokens / Math.max(secs, 0.1);
   return { p: { gist, todo: todoOut, dates: datesOut }, tokens: acc.tokens, secs, speed };
