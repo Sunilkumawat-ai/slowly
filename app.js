@@ -1,4 +1,4 @@
-/* Slowly - app.js (v2)
+/* Slowly - app.js (v3)
    On-device chat summaries with an open-weight model (WebLLM + WebGPU).
    Rules find the facts, the model writes the gist and translates short lines,
    and every model line is checked before it is shown. */
@@ -12,13 +12,13 @@ const ENGINE_URLS = [
 ];
 const KEY_SAVED = "slowly.saved";
 const KEY_BENCH = "slowly.bench";
-const KEY_MODEL = "slowly.model";
+const KEY_MODEL = "slowly.model2";
 const MAX_VRAM = 3800;
 
 const S = {
   webllm: null, engine: null, modelId: null, modelLabel: "", loadSecs: null,
   busy: false, loading: false, unsupported: false, hasF16: false,
-  stopped: false, lang: "English", shownLang: "English"
+  stopped: false, lang: "English", shownLang: "English", autoId: null, lastMsg: ""
 };
 
 const TIERS = [
@@ -33,6 +33,16 @@ const TIERS = [
   { re: /smollm2-1\.7b/i, tag: "Light", rank: 8 }
 ];
 const tierOf = (id) => TIERS.find((t) => t.re.test(id || ""));
+
+/* Best to smaller. The app picks the best one this phone can handle. */
+const PREF_RE = [/qwen3-4b/i, /llama-3\.2-3b/i, /qwen3-1\.7b/i, /llama-3\.2-1b/i];
+function autoStart() {
+  const mem = navigator.deviceMemory || 4, cores = navigator.hardwareConcurrency || 4;
+  if (mem >= 8) return 0;
+  if (mem >= 4 && cores >= 8) return 1;
+  if (mem >= 4) return 2;
+  return 3;
+}
 
 const SAMPLE = `[09:12] Aarav: Guys, are we still doing the Lonavala trip this Saturday?
 [09:14] Meera: Yes! But we need to decide cars. I can drive mine, fits 4.
@@ -198,14 +208,17 @@ function buildModelList() {
   if (!list.length) {
     const o = document.createElement("option"); o.textContent = "No compatible model found"; sel.appendChild(o); return [];
   }
-  const big = (navigator.deviceMemory || 4) >= 8 ? list.find((x) => /llama-3\.2-3b/i.test(x.m.model_id)) : null;
-  const rec = big || list.find((x) => /llama-3\.2-1b/i.test(x.m.model_id)) || list[0];
-  const saved = store.get(KEY_MODEL, null);
+  let rec = null;
+  for (const re of PREF_RE.slice(autoStart())) { rec = list.find((x) => re.test(x.m.model_id)); if (rec) break; }
+  rec = rec || list.find((x) => /llama-3\.2-1b/i.test(x.m.model_id)) || list[0];
+  S.autoId = rec.m.model_id;
+  const sv = store.get(KEY_MODEL, null);
+  const saved = sv && sv.manual ? sv.id : null;
   list.forEach((x) => {
     const o = document.createElement("option");
     const gb = x.m.vram_required_MB ? ` · ${(x.m.vram_required_MB / 1024).toFixed(1)} GB` : "";
     o.value = x.m.model_id;
-    o.dataset.base = prettyName(x.m.model_id) + gb + " · " + x.tier.tag + (x === rec ? " · Recommended" : "");
+    o.dataset.base = prettyName(x.m.model_id) + gb + " · " + x.tier.tag + (x === rec ? " · Auto-picked best" : "");
     o.textContent = o.dataset.base;
     sel.appendChild(o);
   });
@@ -236,7 +249,7 @@ function paintHint() {
 $("#model").addEventListener("change", paintHint);
 
 /* ---------- load model ---------- */
-async function loadModel(id, { auto = false } = {}) {
+async function loadModel(id, { auto = false, quiet = false, manual = false } = {}) {
   if (S.busy || !id || !S.webllm) return false;
   S.busy = true; S.loading = true; hideNotice(); refresh();
   $("#load").disabled = true; $("#model").disabled = true;
@@ -250,7 +263,7 @@ async function loadModel(id, { auto = false } = {}) {
     });
     S.modelId = id; S.modelLabel = prettyName(id);
     S.loadSecs = (performance.now() - t0) / 1000;
-    store.set(KEY_MODEL, id);
+    store.set(KEY_MODEL, { id, manual });
     try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch {}
     setProgress(1);
     setStatus(`${S.modelLabel} loaded in ${S.loadSecs.toFixed(1)}s. It now runs on this device.`, true);
@@ -262,7 +275,8 @@ async function loadModel(id, { auto = false } = {}) {
     S.engine = null; S.modelId = null;
     setProgress(0); setStatus("");
     const msg = String((e && e.message) || e).slice(0, 200);
-    showNotice(msg + " | The model didn't load. Try a smaller model such as Llama 3.2 1B, close other apps and tabs, then try again.");
+    S.lastMsg = msg;
+    if (!quiet) showNotice(failText(msg));
   } finally {
     S.busy = false; S.loading = false;
     $("#load").disabled = false; $("#model").disabled = false;
@@ -271,7 +285,39 @@ async function loadModel(id, { auto = false } = {}) {
   }
   return ok;
 }
-$("#load").addEventListener("click", () => loadModel($("#model").value));
+function failText(msg) {
+  return msg + " | The model didn't load. Try a smaller model such as Llama 3.2 1B, close other apps and tabs, then try again.";
+}
+function chainFor(id) {
+  const i = PREF_RE.findIndex((re) => re.test(id));
+  if (i < 0) return [id];
+  const out = [id];
+  for (const re of PREF_RE.slice(i + 1)) {
+    const o = $$("#model option").find((x) => x.value && re.test(x.value));
+    if (o) out.push(o.value);
+  }
+  return out;
+}
+async function loadWithFallback(id, opts = {}) {
+  const chain = chainFor(id);
+  for (let i = 0; i < chain.length; i++) {
+    const last = i === chain.length - 1;
+    if (i > 0) { $("#model").value = chain[i]; paintHint(); toast("Trying a smaller model that fits this phone…", 3000); }
+    const ok = await loadModel(chain[i], { ...opts, manual: false, quiet: !last });
+    if (ok) return true;
+    if (/fetch|network|offline|failed to load/i.test(S.lastMsg) && !/device|limit|memory|buffer|gpu/i.test(S.lastMsg)) {
+      showNotice(failText(S.lastMsg)); return false;
+    }
+  }
+  return false;
+}
+async function isCached(id) {
+  try { return !!(S.webllm.hasModelInCache && await S.webllm.hasModelInCache(id)); } catch { return false; }
+}
+$("#load").addEventListener("click", () => {
+  const id = $("#model").value;
+  if (id === S.autoId) loadWithFallback(id); else loadModel(id, { manual: true });
+});
 
 /* ---------- input controls ---------- */
 chat.addEventListener("input", paintCount);
@@ -369,6 +415,21 @@ function gistOk(g, text) {
   if (inventedNames(g, text)) return false;
   return true;
 }
+function sentenceCase(g, text, names) {
+  const ws = g.match(/[A-Za-z][A-Za-z'-]*/g) || [];
+  if (ws.length < 4 || ws.filter((w) => /^[A-Z]/.test(w)).length < ws.length * 0.6) return g;
+  const keep = new Set([...names, ...DAYS, ...MONTHS]);
+  (text.match(/[a-z,] ([A-Z][a-z]{2,})/g) || []).forEach((x) => keep.add(x.slice(2).toLowerCase()));
+  let first = true;
+  let out = g.replace(/[A-Za-z][A-Za-z'-]*/g, (w) => {
+    const k = w.toLowerCase();
+    if (first) { first = false; return w; }
+    if (/^[A-Z][a-z]+$/.test(w) && !keep.has(k) && text.toLowerCase().includes(k)) return k;
+    return w;
+  });
+  if (!/[.!?।]$/.test(out)) out += ".";
+  return out;
+}
 function firstSentences(s, n) {
   return s.replace(/^\s*(?:here(?:'s| is)[^:\n]*:|sure[,!.:]?|gist:|summary:)\s*/i, "")
     .replace(/^["'`]+|["'`]+$/g, "").trim().split(/(?<=[.!?])\s+/).slice(0, n).join(" ").trim();
@@ -446,6 +507,9 @@ const LEX = {
   details: ["details", "जानकारी"], message: ["message", "मैसेज"], email: ["email", "ईमेल"],
   decorations: ["decorations", "सजावट"], balloons: ["balloons", "गुब्बारे"], games: ["games", "गेम्स"],
   rupees: ["rupaye", "रुपये"], rupee: ["rupaye", "रुपये"], rs: ["rupaye", "रुपये"],
+  notes: ["notes", "नोट्स"], library: ["library", "लाइब्रेरी"], printing: ["printing", "प्रिंटिंग"], project: ["project", "प्रोजेक्ट"],
+  office: ["office", "ऑफ़िस"], home: ["ghar", "घर"], college: ["college", "कॉलेज"], school: ["school", "स्कूल"], class: ["class", "क्लास"],
+  exam: ["exam", "परीक्षा"], homework: ["homework", "होमवर्क"], assignment: ["assignment", "असाइनमेंट"], presentation: ["presentation", "प्रेज़ेंटेशन"],
   and: ["aur", "और"], all: ["sab", "सब"], everyone: ["sab log", "सब लोग"], each: ["har ek", "हर एक"]
 };
 const VERBS = {
@@ -478,7 +542,7 @@ function trObj(tokens, lang, names) {
     if (!w) continue;
     const k = w.toLowerCase();
     if (DET.has(k)) continue;
-    if (/^\d[\d,.:]*$/.test(w)) { out.push(w); continue; }
+    if (/^[₹$€]?\d[\d,.:]*$/.test(w)) { out.push(w); continue; }
     if (names.has(k)) { out.push(w); continue; }
     if (LEX[k]) { out.push(LEX[k][hi ? 1 : 0]); continue; }
     if (FUNC.has(k) || hi) return null;
@@ -486,11 +550,33 @@ function trObj(tokens, lang, names) {
   }
   return out;
 }
-function ruleTr(src, lang, names) {
+function ruleTrRaw(src, lang, names) {
   if (lang === "English") return null;
-  const s = src.trim().replace(/[.!?।]+$/, "").replace(/^(?:i will|i'll|will|to|please)\s+/i, "");
+  const hi = lang === "Hindi";
+  let s = src.trim().replace(/[.!?।]+$/, "");
   if (!s || /[\u0900-\u097F]/.test(s)) return null;
-  const hi = lang === "Hindi", w = s.split(/\s+/);
+  const late = /^(?:i\s+)?(might be|may be|will be|'ll be|be)\s+(\d+)\s+(minutes?|mins?|hours?|hrs?)\s+late$/i.exec(s);
+  if (late) {
+    const maybe = /might|may/i.test(late[1]), h = /^h/i.test(late[3]);
+    const unit = hi ? (h ? "घंटे" : "मिनट") : (h ? "ghante" : "minute");
+    return late[2] + " " + unit + " " + (hi ? "देर " + (maybe ? "हो सकती है" : "होगी") : "der " + (maybe ? "ho sakti hai" : "hogi"));
+  }
+  s = s.replace(/^(?:i will|i'll|will|to|please)\s+/i, "");
+  const ev = /^(?:everyone|everybody|all|guys)\s+(.+)$/i.exec(s);
+  if (ev) { const r = ruleTrRaw(ev[1], lang, names); return r ? (hi ? "सब लोग " : "sab log ") + r : null; }
+  const loc = /^(?:in|at)\s+(?:the\s+)?([A-Za-z]+)$/i.exec(s);
+  if (loc) {
+    const k = loc[1].toLowerCase();
+    if (LEX[k]) return LEX[k][hi ? 1 : 0] + (hi ? " में" : " mein");
+    return null;
+  }
+  const fm = /^(.+?)\s+for\s+([A-Za-z]+)$/i.exec(s);
+  if (fm && LEX[fm[2].toLowerCase()]) {
+    const head = ruleTrRaw(fm[1], lang, names);
+    if (head) return LEX[fm[2].toLowerCase()][hi ? 1 : 0] + (hi ? " के लिए " : " ke liye ") + head;
+    return null;
+  }
+  const w = s.split(/\s+/);
   const two = w.slice(0, 2).join(" ").toLowerCase();
   const key = VERBS[two] ? two : VERBS[w[0].toLowerCase()] ? w[0].toLowerCase() : null;
   if (key) {
@@ -500,20 +586,23 @@ function ruleTr(src, lang, names) {
     const obj = trObj(rest, lang, names);
     if (!obj) return null;
     const post = v[2] && obj.length ? v[2][hi ? 1 : 0] : "";
-    const parts = [me ? (hi ? "मुझे" : "mujhe") : "", ...obj, post, v[hi ? 1 : 0], hi ? "है" : "hai"].filter(Boolean);
-    return capFirst(parts.join(" "));
+    return [me ? (hi ? "मुझे" : "mujhe") : "", ...obj, post, v[hi ? 1 : 0], hi ? "है" : "hai"].filter(Boolean).join(" ");
   }
   if (w.length > 4) return null;
   const parts = [];
   for (const raw of w) {
     const k = raw.toLowerCase();
     if (DET.has(k)) continue;
-    if (/^\d[\d,.:]*$/.test(raw)) parts.push(raw);
+    if (/^[₹$€]?\d[\d,.:]*$/.test(raw)) parts.push(raw);
     else if (names.has(k)) parts.push(raw);
     else if (LEX[k]) parts.push(LEX[k][hi ? 1 : 0]);
     else return null;
   }
-  return parts.length ? capFirst(parts.join(" ")) : null;
+  return parts.length ? parts.join(" ") : null;
+}
+function ruleTr(src, lang, names) {
+  const r = ruleTrRaw(src, lang, names);
+  return r ? capFirst(r) : null;
 }
 
 /* ---------- facts from the chat (rules only) ---------- */
@@ -560,18 +649,36 @@ function extractRules(text, msgs, modelLines = []) {
     const owner = r[1] && speakers.has(r[1].toLowerCase()) ? r[1] : null;
     todo.push({ who: owner || m.who, what, when: whenOf(m.msg), ask: !owner });
   }
+  const REQ = /^(?:(?:everyone|everybody|all|guys)[,\s]+)?(?:send|pay|bring|book|forward|submit|confirm|share|reply|call|buy|collect)\b/i;
+  for (const m of items) {
+    if (/\?\s*$/.test(m.msg)) continue;
+    const c = clean(m.msg).replace(/^(?:[A-Za-z]+,\s+)?please\s+/i, "");
+    if (!REQ.test(c)) continue;
+    const what = core(c);
+    if (!what || taken(what)) continue;
+    todo.push({ who: m.who, what, when: whenOf(m.msg), ask: true });
+  }
   for (const l of modelLines) {
     const i = l.indexOf(":");
     if (i < 1) continue;
     const who = l.slice(0, i).trim(), what = l.slice(i + 1).trim().replace(/[,.! ]+$/, "");
     if (speakers.size && !speakers.has(who.toLowerCase())) continue;
-    if (!what || what.length > 90 || gibberish(what) || taken(what)) continue;
+    if (!what || what.length > 90 || /\?\s*$/.test(what) || gibberish(what) || taken(what)) continue;
     todo.push({ who, what, when: [], ask: false });
   }
 
   const pool = msgs.length ? items : text.split(/[\n.!?]+/).map((s) => ({ who: "", msg: s.replace(STAMP, "").trim() })).filter((m) => m.msg);
   const dates = [], seenD = new Set();
   for (const m of pool) {
+    if (/\?\s*$/.test(m.msg.trim())) continue;
+    const lt = /\b(might be|may be|will be|'ll be)\s+(\d+)\s*(minutes?|mins?|hours?|hrs?)\s+late\b/i.exec(m.msg);
+    if (lt) {
+      const n = +lt[2], unit = /^h/i.test(lt[3]) ? (n === 1 ? "hour" : "hours") : (n === 1 ? "minute" : "minutes");
+      const what = `${/might|may/i.test(lt[1]) ? "might be" : "will be"} ${n} ${unit} late`;
+      const key = (m.who + what).toLowerCase();
+      if (!seenD.has(key)) { seenD.add(key); dates.push({ who: m.who, what, when: [] }); }
+      continue;
+    }
     if (!dayRe.test(m.msg)) continue;
     const when = whenOf(m.msg);
     let what = (when.length ? core(m.msg) : "") || clean(m.msg).replace(/[,.!? ]+$/, "");
@@ -637,10 +744,11 @@ const HINGLISH_OK = new Set(("hai hain tha thi the ho hoga hogi honge hua hui hu
 function keeps(src, out, lang, names) {
   const lo = out.toLowerCase();
   const ws = src.match(/[A-Za-z][A-Za-z'-]*/g) || [];
+  const titled = ws.length > 3 && ws.filter((w) => /^[A-Z]/.test(w)).length >= ws.length * 0.6;
   const okWords = ws.every((w, i) => {
     const k = w.toLowerCase();
     if (DAYS.includes(k)) return lang === "Hindi" ? lo.includes(k) || lo.includes(L10N.Hindi.days[k]) : lo.includes(k);
-    if (names.has(k) || (i > 0 && /^[A-Z][a-z]/.test(w))) return lo.includes(k);
+    if (names.has(k) || (!titled && i > 0 && /^[A-Z][a-z]/.test(w))) return lo.includes(k);
     return true;
   });
   if (!okWords) return false;
@@ -751,7 +859,7 @@ async function summarize(text, lang, hooks = {}) {
   const N = lang === "English" ? [7, 6] : [6, 5];
   const T = rules.todo.slice(-N[0]), D = rules.dates.slice(-N[1]);
 
-  let gist = firstSentences(lines(gistRaw).join(" "), 2);
+  let gist = sentenceCase(firstSentences(lines(gistRaw).join(" "), 2), text, names);
   let fb = false;
   if (!gistOk(gist, text)) {
     if (gibberish(gistRaw)) hooks.onWarn?.(BROKEN_MSG);
@@ -1046,13 +1154,25 @@ async function importEngine() {
     showNotice(msg); readNotice(msg);
     return;
   }
-  const list = buildModelList();
-  setStatus("Pick a model and load it. You only do this once per device.");
+  buildModelList();
   await markCached();
-  const saved = store.get(KEY_MODEL, null);
-  if (saved && list.some((x) => x.m.model_id === saved)) {
-    try {
-      if (S.webllm.hasModelInCache && await S.webllm.hasModelInCache(saved)) { $("#model").value = saved; paintHint(); loadModel(saved, { auto: true }); }
-    } catch {}
+  const want = $("#model").value, sv = store.get(KEY_MODEL, null);
+  const manual = !!(sv && sv.manual && sv.id === want);
+  if (await isCached(want)) {
+    paintHint();
+    if (manual) loadModel(want, { auto: true, manual: true }); else loadWithFallback(want, { auto: true });
+  } else if (!manual) {
+    let used = false;
+    for (const id of chainFor(want).slice(1)) {
+      if (await isCached(id)) {
+        $("#model").value = id; paintHint(); used = true;
+        await loadModel(id, { auto: true });
+        toast("A better model is available. Tap Change to get it.", 3500);
+        break;
+      }
+    }
+    if (!used) setStatus("Best model for your phone: " + prettyName(want) + ". Tap Download and load model. You only do this once.");
+  } else {
+    setStatus("Pick a model and load it. You only do this once per device.");
   }
 })();
