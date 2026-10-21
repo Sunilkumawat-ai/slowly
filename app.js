@@ -434,3 +434,165 @@ $("#go").addEventListener("click", async () => {
   }
 });
 $("#stop").addEventListener("click", () => { S.stopped = true; try { S.engine.interruptGenerate(); } catch {} });
+
+/* ---------- copy / share ---------- */
+function asText() {
+  const li = (id) => $$(id + " li span").map((s) => "- " + s.textContent).join("\n");
+  return `${$("#gist").textContent}\n\nTo do\n${li("#todo") || "- None"}\n\nDates and plans\n${li("#dates") || "- None"}`;
+}
+$("#copy").addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText(asText()); toast("Copied"); haptic(8); } catch { toast("Copy failed"); }
+});
+if (navigator.share) {
+  $("#share").classList.remove("hidden");
+  $("#share").addEventListener("click", () => navigator.share({ title: "Chat summary", text: asText() }).catch(() => {}));
+}
+
+/* ---------- saved ---------- */
+function titleOf(g) { return g.split(/\s+/).slice(0, 7).join(" ").replace(/[.,;:!?]+$/, ""); }
+function addSaved(p) {
+  const list = store.get(KEY_SAVED, []);
+  list.unshift({ id: Date.now(), ts: Date.now(), title: titleOf(p.gist), gist: p.gist, todo: p.todo, dates: p.dates, model: S.modelLabel, lang: S.lang });
+  store.set(KEY_SAVED, list.slice(0, 100));
+  renderSaved();
+}
+function renderSaved() {
+  const q = $("#q").value.trim().toLowerCase();
+  const all = store.get(KEY_SAVED, []);
+  const list = q ? all.filter((x) => (x.title + " " + x.gist + " " + x.todo.join(" ")).toLowerCase().includes(q)) : all;
+  const box = $("#saved"); box.textContent = "";
+  $("#wipe").classList.toggle("hidden", !all.length);
+  if (!list.length) {
+    const d = document.createElement("div"); d.className = "empty-state";
+    d.textContent = all.length ? "No matches." : "Nothing saved yet. Summaries you make appear here.";
+    box.appendChild(d); return;
+  }
+  list.forEach((x) => {
+    const el = document.createElement("div");
+    el.className = "item"; el.tabIndex = 0; el.setAttribute("role", "button"); el.dataset.id = x.id;
+    const h = document.createElement("h3"); h.textContent = x.title;
+    const p = document.createElement("p"); p.textContent = x.gist;
+    const s = document.createElement("small"); s.textContent = fmtDate(x.ts) + " · " + x.model;
+    const del = document.createElement("button");
+    del.type = "button"; del.className = "btn quiet"; del.dataset.del = x.id; del.textContent = "Delete";
+    del.style.marginTop = "8px"; del.style.paddingLeft = "0";
+    el.append(h, p, s, del); box.appendChild(el);
+  });
+}
+function openSaved(el) {
+  const x = store.get(KEY_SAVED, []).find((v) => v.id === +el.dataset.id);
+  if (!x) return;
+  showResult({ gist: x.gist, todo: x.todo, dates: x.dates }, null);
+  goTab(0);
+  $("#result").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+$("#saved").addEventListener("click", (e) => {
+  const del = e.target.closest("[data-del]");
+  if (del) {
+    store.set(KEY_SAVED, store.get(KEY_SAVED, []).filter((x) => x.id !== +del.dataset.del));
+    renderSaved(); haptic(8); return;
+  }
+  const it = e.target.closest(".item"); if (it) openSaved(it);
+});
+$("#saved").addEventListener("keydown", (e) => {
+  if (e.key !== "Enter") return;
+  const it = e.target.closest(".item"); if (it && e.target === it) openSaved(it);
+});
+$("#q").addEventListener("input", renderSaved);
+$("#wipe").addEventListener("click", () => {
+  if (confirm("Delete all saved summaries from this phone?")) { store.set(KEY_SAVED, []); renderSaved(); }
+});
+
+/* ---------- lab: benchmark ---------- */
+function renderBench() {
+  const rows = store.get(KEY_BENCH, []);
+  const tb = $("#rows"); tb.textContent = "";
+  rows.forEach((r) => {
+    const tr = document.createElement("tr");
+    [r.model, r.load != null ? r.load.toFixed(1) + " s" : "-", r.tps.toFixed(1), r.secs.toFixed(1) + " s"].forEach((v) => {
+      const td = document.createElement("td"); td.textContent = v; tr.appendChild(td);
+    });
+    tb.appendChild(tr);
+  });
+  const has = rows.length > 0;
+  $("#tblWrap").classList.toggle("hidden", !has);
+  $("#exportMd").classList.toggle("hidden", !has);
+  $("#clearBench").classList.toggle("hidden", !has);
+}
+$("#bench").addEventListener("click", async () => {
+  if (!S.engine || S.busy) return;
+  S.busy = true; S.stopped = false; hideNotice(); refresh();
+  const btn = $("#bench"); btn.textContent = "Running…";
+  try {
+    const r = await summarize(BENCH_CHAT, "English");
+    const rows = store.get(KEY_BENCH, []);
+    rows.push({ model: S.modelLabel, load: S.loadSecs, tps: r.speed, secs: r.secs, tokens: r.tokens });
+    store.set(KEY_BENCH, rows);
+    renderBench(); toast("Benchmark saved"); haptic([10, 40, 10]);
+  } catch (e) {
+    console.error(e); showNotice("The benchmark failed. Try again, or reload the model.");
+  } finally {
+    S.busy = false; btn.textContent = "Run benchmark"; refresh();
+  }
+});
+$("#exportMd").addEventListener("click", async () => {
+  const rows = store.get(KEY_BENCH, []);
+  const md = [
+    "| Model | Load (s) | Tokens/s | Total (s) |",
+    "|---|---|---|---|",
+    ...rows.map((r) => `| ${r.model} | ${r.load != null ? r.load.toFixed(1) : "-"} | ${r.tps.toFixed(1)} | ${r.secs.toFixed(1)} |`)
+  ].join("\n");
+  try { await navigator.clipboard.writeText(md); toast("Copied as Markdown"); } catch { toast("Copy failed"); }
+});
+$("#clearBench").addEventListener("click", () => { store.set(KEY_BENCH, []); renderBench(); });
+
+/* ---------- install + service worker + share target ---------- */
+let deferredInstall = null;
+addEventListener("beforeinstallprompt", (e) => { e.preventDefault(); deferredInstall = e; $("#install").classList.remove("hidden"); });
+$("#installBtn").addEventListener("click", async () => {
+  if (!deferredInstall) return;
+  deferredInstall.prompt();
+  try { await deferredInstall.userChoice; } catch {}
+  deferredInstall = null; $("#install").classList.add("hidden");
+});
+if ("serviceWorker" in navigator) {
+  addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(() => {}));
+}
+async function takeShared() {
+  const q = new URLSearchParams(location.search);
+  let text = q.get("text") || "";
+  if (q.get("shared") === "file") {
+    try {
+      const c = await caches.open("slowly-share");
+      const r = await c.match("shared-text");
+      if (r) { text = await r.text(); await c.delete("shared-text"); }
+    } catch {}
+  }
+  if (text) {
+    chat.value = text; paintCount();
+    history.replaceState(null, "", location.pathname);
+    toast("Chat received");
+  }
+}
+
+/* ---------- boot ---------- */
+(async function boot() {
+  paintCount(); renderSaved(); renderBench(); takeShared();
+  setStatus("Checking your device…");
+  const gpu = await detectGpu();
+  if (!gpu) {
+    setStatus("");
+    showNotice("This browser does not support WebGPU, which the on-device model needs. Open this page in a recent Chrome on Android (version 121 or newer) and make sure Chrome is up to date.");
+    $("#model").textContent = ""; const o = document.createElement("option"); o.textContent = "Not supported on this browser"; $("#model").appendChild(o);
+    return;
+  }
+  try {
+    S.webllm = await import(ENGINE_URL);
+    buildModelList();
+    setStatus("Pick a model and load it. You only do this once per device.");
+  } catch (e) {
+    console.error(e);
+    setStatus("");
+    showNotice("Couldn't load the model engine. Check your connection and reload the page.");
+  }
+})();
