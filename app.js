@@ -632,7 +632,8 @@ function extractRules(text, msgs, modelLines = []) {
   const dayRe = /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|tonight|noon|kal|parso|aaj|subah|shaam|raat|dopahar|baje|somvar|mangalvar|budhvar|guruvar|shukravar|shanivar|ravivar)\b|\b\d{1,2}(:\d{2})?\s?(am|pm|baje)\b|\b\d{1,2}:\d{2}\b|\b\d{1,2}(st|nd|rd|th)\b|कल|परसों|आज|सुबह|शाम|रात|बजे|सोमवार|मंगलवार|बुधवार|गुरुवार|शुक्रवार|शनिवार|रविवार/i;
   const whenRe = /(?:\b(?:on|at|by|before|till|until)\s+)?(?:\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|tonight)\b(?:\s+(?:morning|afternoon|evening|night))?|\b\d{1,2}(?::\d{2})?\s?(?:am|pm)\b|\b\d{1,2}:\d{2}\b)/gi;
   const clean = (s) => s.replace(/^(?:(?:yes|yeah|yep|yup|ok(?:ay)?|sure|done|great|fine|cool|alright|agreed|haan|ha|theek hai|pakka)\b[,.!\s]*)+/i, "").trim();
-  const core = (msg) => clean(msg.replace(whenRe, ""))
+  const HING = /\b(hai|hain|nahi|nahin|karna|kar|karo|karenge|karunga|karungi|karta|karti|bhej|bata|batana|dekh|lena|dena|aur|ko|tak|baje|kaun|kya|kab|kahan|haan|theek|pakka|mujhe|tumhe|hoga|hogi|nikal\w*|mein|raha|rahe|rahi|shayad|wapas)\b|[\u0900-\u097F]/i;
+  const core = (msg) => clean(HING.test(msg) ? msg : msg.replace(whenRe, ""))
     .replace(/\s+/g, " ").replace(/\s+([.,!?])/g, "$1")
     .replace(/^(i will|i'll|i am going to|i'm going to)\s+/i, "")
     .replace(/[,.!? ]+$/, "").trim();
@@ -651,13 +652,14 @@ function extractRules(text, msgs, modelLines = []) {
   };
   const todo = [];
   const taken = (what) => todo.some((x) => similar(x.what, what));
-  const willRe = /\b(i will|i'll|i am going to|i'm going to)\b|\b\w+(unga|ungi)\b/i;
+  const willRe = /\b(i will|i'll|i am going to|i'm going to)\b|\b\w+(unga|ungi)\b|\b(?:karta|karti)\s+(?:hu|hoon|hun)\b/i;
   const WILL = /\b(?:i will|i'll|i am going to|i'm going to)\s+/i;
 
   for (const m of items) {
     const c = clean(m.msg);
     if (!willRe.test(c)) continue;
     if (/\b(i will|i'll)\s+be\b/i.test(c)) continue;
+    if (/\b(nahi|nahin|shayad)\b/i.test(c)) continue;
     const wm = WILL.exec(m.msg);
     const what = core(wm ? m.msg.slice(wm.index + wm[0].length) : m.msg);
     if (what) todo.push({ who: m.who, what, when: whenOf(m.msg), ask: false });
@@ -679,6 +681,18 @@ function extractRules(text, msgs, modelLines = []) {
     if (!what || taken(what)) continue;
     todo.push({ who: m.who, what, when: whenOf(m.msg), ask: true });
   }
+  const HREQ = /\b(?:bhej|bata|dekh|le|kar|de|rakh|puch|bula|bhijwa)\s+(?:do|dena|lena|lo|dijiye|dijiyo)\b/i;
+  for (const m of items) {
+    if (/\?\s*$/.test(m.msg)) continue;
+    const c = clean(m.msg), hm = HREQ.exec(c);
+    if (!hm) continue;
+    let part = c.slice(0, hm.index + hm[0].length), owner = null;
+    const o = /^([A-Za-z]+),\s+(.+)$/.exec(part);
+    if (o && speakers.has(o[1].toLowerCase())) { owner = o[1]; part = o[2]; }
+    const what = core(part);
+    if (!what || taken(what)) continue;
+    todo.push({ who: owner || m.who, what, when: whenOf(m.msg), ask: !owner });
+  }
   for (const l of modelLines) {
     const i = l.indexOf(":");
     if (i < 1) continue;
@@ -692,7 +706,7 @@ function extractRules(text, msgs, modelLines = []) {
   const dates = [], seenD = new Set();
   for (const m of pool) {
     const isQ = /\?\s*$/.test(m.msg.trim());
-    if (isQ && (/\b(are|is|do|does|did|can|could|shall|should|who|what|when|where|why|how|kya|kaun)\b/i.test(m.msg) || !dayRe.test(m.msg))) continue;
+    if (isQ && (/\b(are|is|do|does|did|can|could|shall|should|who|what|when|where|why|how|kya|kaun|kab|kahan|kyun|kaise|na)\b/i.test(m.msg) || !dayRe.test(m.msg))) continue;
     const lt = /\b(might be|may be|will be|'ll be)\s+(\d+)\s*(minutes?|mins?|hours?|hrs?)\s+late\b/i.exec(m.msg);
     if (lt) {
       const n = +lt[2], unit = /^h/i.test(lt[3]) ? (n === 1 ? "hour" : "hours") : (n === 1 ? "minute" : "minutes");
